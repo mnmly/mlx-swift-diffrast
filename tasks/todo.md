@@ -81,11 +81,17 @@ from every pixel center.
 - [ ] Replace per-pixel ∀-triangle loop with a tile-based hierarchical pass
       when triangle counts grow beyond a few thousand
 
-### M3 — `texture`
-- [ ] Forward: bilinear / trilinear sampling with mipmap pyramid + boundary modes
-      (wrap, clamp, zero, cube). Metal samplers cover most; cube mode needs manual indexing.
-- [ ] `texture_construct_mip` — produce mip pyramid as a list of MLXArrays.
-- [ ] Backward: gradient w.r.t. `tex`, `uv`, `uv_da`, `mip_level_bias`.
+### M3 — `texture` (✅ M3.1 DONE — bilinear; mipmap and cube deferred)
+- [x] Bilinear forward with three boundary modes (wrap, clamp, zero)
+- [x] VJP for `tex` (atomic scatter-add) and `uv` (per-pixel analytic)
+- [x] 4 gradchecks across boundary modes + 5 forward correctness tests
+- [ ] `texture_construct_mip` + mipmap-linear / linear-mipmap-linear filters
+- [ ] `uv_da` / `mip_level_bias`-driven LOD selection
+- [ ] Cube textures + `cube` boundary mode
+
+Metal-kernel note: template args (e.g. `BOUNDARY`) are NOT visible inside the
+`header:` block — they only resolve in the main kernel body. Helper functions
+in the header must take what they need as explicit parameters.
 
 ### M4 — `antialias`
 - [ ] `antialias_construct_topology_hash` — build edge hash from `tri`.
