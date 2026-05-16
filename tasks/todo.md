@@ -40,16 +40,40 @@ Test count: 9/9 passing (forward constant, empty pixels, DA analytic, range-mode
 + 5 gradchecks). `xcodebuild -scheme mlx-swift-diffrast -destination 'platform=macOS' test`
 
 ### M2 — `rasterize`
-- [ ] Decide backend: Metal render pass (uses fixed-function rasterizer, fastest) vs
-      pure compute (more portable, easier to integrate with MLX streams).
-      Recommend: render-pass forward, compute backward — same split nvdiffrast uses.
-- [ ] Forward: vertex shader does NDC transform, fragment shader writes
-      `(u, v, z/w, tri_id+1)` into an `MTLTexture`, then blit into MLXArray storage.
-- [ ] Need a `RasterizeContext` (analogue of `RasterizeCudaContext`) holding the
-      `MTLDevice`, pipeline state, depth texture pool.
-- [ ] Backward: per-pixel compute kernel — gradients flow into `pos` via the
-      barycentric chain rule (see `csrc/common/rasterize.h` in upstream).
-- [ ] Optional: `rast_db` (image-space barycentric derivatives).
+Decision: pure-compute software rasterizer for v1 (simpler MLX-stream
+integration, no MTLTexture↔MLXArray plumbing). Can swap to an
+MTLRenderPipeline backend later behind the same API if perf demands.
+
+#### M2.1 — Forward only (✅ DONE)
+- [x] `DiffRast.rasterize(pos, tri, resolution)` public API
+- [x] Per-pixel compute kernel iterating over all triangles, signed-area edge
+      functions, depth test, NDC z range check
+- [x] Output layout `(u, v, z/w, tri_id+1)` matches what `interpolate` consumes
+- [x] 4 tests including an end-to-end `rasterize → interpolate` check
+- [x] Placeholder VJP returns zeros — backward deferred to M2.3
+
+#### M2.2 — Pixel derivatives `rast_db`
+- [ ] Optional second output `[N,H,W,4]` with `(du/dx, du/dy, dv/dx, dv/dy)`.
+- [ ] These are constants per triangle (linear barycentrics in screen space),
+      so a single per-pixel write suffices once the covering triangle is known.
+- [ ] Likely fold into the existing forward kernel under a template flag rather
+      than a second kernel pass.
+
+#### M2.3 — Backward
+- [ ] Replace the placeholder VJP. Gradients from `d_rast[u,v,z/w]` flow into
+      `pos` via:
+        1. Chain through perspective divide: d(NDC)/d(clip).
+        2. Chain through screen-space barycentric formula: d(u,v)/d(s0,s1,s2).
+        3. Depth: d(z_pix)/d(z_k, w_k) at each vertex via the linear combo.
+- [ ] Strategy: per-pixel compute kernel that emits per-vertex contributions
+      with atomic scatter-add into `d_pos` (analogous to interpolate's d_attr).
+- [ ] Add to gradcheck test suite once it lands.
+
+#### Deferred
+- [ ] Range mode (`pos` shape `[V, 4]` + `ranges` tensor)
+- [ ] `DepthPeeler` analog for transparency
+- [ ] Replace per-pixel ∀-triangle loop with a tile-based hierarchical pass
+      when triangle counts grow beyond a few thousand
 
 ### M3 — `texture`
 - [ ] Forward: bilinear / trilinear sampling with mipmap pyramid + boundary modes
