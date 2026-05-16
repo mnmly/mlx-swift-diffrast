@@ -1,5 +1,6 @@
 import XCTest
 import MLX
+import MLXRandom
 @testable import MLXDiffRast
 
 final class RasterizeTests: XCTestCase {
@@ -165,6 +166,83 @@ final class RasterizeTests: XCTestCase {
         let flat = outDA.asArray(Float.self)
         XCTAssertEqual(flat[0], 2.0, accuracy: 1e-5)
         XCTAssertEqual(flat[1], 1.0, accuracy: 1e-5)
+    }
+
+    // MARK: - Gradcheck (M2.3 backward)
+
+    /// Triangle whose interior strictly contains all pixel centers AND whose
+    /// edges stay >0.5 away from any of them, so 1e-3 perturbations on `pos`
+    /// can't flip coverage. Crucial for FD: edge-crossing discontinuities
+    /// would make finite differences disagree with the analytic gradient.
+    ///
+    /// Vertices: V0=(-3, 3), V1=(-3, -3), V2=(3, 0) — none of the three edges
+    /// pass near pixel centers in our 2×2 image (NDC ±0.5). Distinct z per
+    /// vertex so the z-gradient path is exercised.
+    private func fullCoverPos() -> MLXArray {
+        MLXArray([
+            Float(-3),  3, 0.0, 1,
+            Float(-3), -3, 0.1, 1,
+            Float( 3),  0, -0.1, 1,
+        ], [1, 3, 4])
+    }
+
+    func testGradcheckRastWithoutDB() throws {
+        try runRasterizeGradcheck(useDB: false)
+    }
+
+    func testGradcheckRastAndDB() throws {
+        try runRasterizeGradcheck(useDB: true)
+    }
+
+    private func runRasterizeGradcheck(useDB: Bool) throws {
+        let N = 1, H = 2, W = 2
+        let tri = MLXArray([Int32(0), 1, 2], [1, 3])
+        let pos0 = fullCoverPos()
+
+        // Deterministic, distinct cotangent weights — avoids RNG-state surprises and
+        // makes per-channel contributions easy to reason about. Tri-id channel (3) is
+        // zeroed since it's non-differentiable.
+        var wRastVals = [Float]()
+        for i in 0..<(N * H * W * 4) {
+            wRastVals.append(i % 4 == 3 ? 0.0 : Float(1 + i % 7) * 0.1)
+        }
+        let wRast = MLXArray(wRastVals, [N, H, W, 4])
+
+        var wRastDBVals = [Float]()
+        for i in 0..<(N * H * W * 4) {
+            wRastDBVals.append(useDB ? Float(2 + i % 5) * 0.05 : 0.0)
+        }
+        let wRastDB = MLXArray(wRastDBVals, [N, H, W, 4])
+
+        let loss: (MLXArray) -> MLXArray = { pos in
+            let (r, db) = DiffRast.rasterize(
+                pos, tri: tri, resolution: (height: H, width: W), gradDB: useDB)
+            if useDB {
+                return (r * wRast).sum() + (db * wRastDB).sum()
+            } else {
+                return (r * wRast).sum()
+            }
+        }
+
+        let analytic = MLX.grad(loss)(pos0)
+        analytic.eval()
+        let analyticFlat = analytic.asArray(Float.self)
+
+        let eps: Float = 1e-3
+        let flat = pos0.asArray(Float.self)
+        var numeric = [Float](repeating: 0, count: flat.count)
+        for i in 0..<flat.count {
+            var plus = flat; plus[i] += eps
+            var minus = flat; minus[i] -= eps
+            let lp = loss(MLXArray(plus, pos0.shape)).item(Float.self)
+            let lm = loss(MLXArray(minus, pos0.shape)).item(Float.self)
+            numeric[i] = (lp - lm) / (2 * eps)
+        }
+
+        for i in 0..<flat.count {
+            XCTAssertEqual(analyticFlat[i], numeric[i], accuracy: 5e-3,
+                           "[useDB=\(useDB)] pos elem \(i): analytic \(analyticFlat[i]) vs fd \(numeric[i])")
+        }
     }
 
     /// Sanity: feeding the rast output into `interpolate` produces non-zero attrs

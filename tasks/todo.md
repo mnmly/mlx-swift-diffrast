@@ -59,15 +59,21 @@ MTLRenderPipeline backend later behind the same API if perf demands.
 - [x] `rast_db` analytic test on a known triangle
 - [x] End-to-end `rasterize(gradDB=true) → interpolate(diffAttrs=.all)` test
 
-#### M2.3 — Backward
-- [ ] Replace the placeholder VJP. Gradients from `d_rast[u,v,z/w]` flow into
-      `pos` via:
-        1. Chain through perspective divide: d(NDC)/d(clip).
-        2. Chain through screen-space barycentric formula: d(u,v)/d(s0,s1,s2).
-        3. Depth: d(z_pix)/d(z_k, w_k) at each vertex via the linear combo.
-- [ ] Strategy: per-pixel compute kernel that emits per-vertex contributions
-      with atomic scatter-add into `d_pos` (analogous to interpolate's d_attr).
-- [ ] Add to gradcheck test suite once it lands.
+#### M2.3 — Backward (✅ DONE)
+- [x] Per-pixel compute kernel computes the full chain:
+      screen-bary partials → perspective divide → atomic scatter-add into `d_pos`
+- [x] Handles both `gradDB=true/false` via a single kernel — the no-DB path
+      passes a zero `d_rast_db` so the rast_db terms drop out
+- [x] `rast_db` values are recomputed from `pos` inline (saves a tensor input)
+- [x] Two gradcheck tests (with and without DB) pass against MLX `grad` vs
+      central FD on a fixture chosen to keep all pixels well inside the triangle
+      so silhouette-edge discontinuities don't poison FD
+
+**Test fixture lesson:** when gradchecking a rasterizer, pixel centers must not
+lie ON triangle edges. Edge pixels flip coverage discretely under tiny `pos`
+perturbations, making FD wildly disagree with the (correct) smooth-interior
+analytic gradient. See `fullCoverPos()` for a triangle with edges >0.5 NDC
+from every pixel center.
 
 #### Deferred
 - [ ] Range mode (`pos` shape `[V, 4]` + `ranges` tensor)
