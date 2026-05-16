@@ -52,12 +52,12 @@ MTLRenderPipeline backend later behind the same API if perf demands.
 - [x] 4 tests including an end-to-end `rasterize → interpolate` check
 - [x] Placeholder VJP returns zeros — backward deferred to M2.3
 
-#### M2.2 — Pixel derivatives `rast_db`
-- [ ] Optional second output `[N,H,W,4]` with `(du/dx, du/dy, dv/dx, dv/dy)`.
-- [ ] These are constants per triangle (linear barycentrics in screen space),
-      so a single per-pixel write suffices once the covering triangle is known.
-- [ ] Likely fold into the existing forward kernel under a template flag rather
-      than a second kernel pass.
+#### M2.2 — Pixel derivatives `rast_db` (✅ DONE)
+- [x] Public API now returns `(rast, rastDB)` tuple; `gradDB: Bool = true` default
+- [x] Second forward kernel `fwd_db` emits `(du/dx, du/dy, dv/dx, dv/dy)` in
+      per-pixel units (chain rule through the NDC↔pixel mapping baked in)
+- [x] `rast_db` analytic test on a known triangle
+- [x] End-to-end `rasterize(gradDB=true) → interpolate(diffAttrs=.all)` test
 
 #### M2.3 — Backward
 - [ ] Replace the placeholder VJP. Gradients from `d_rast[u,v,z/w]` flow into

@@ -31,7 +31,7 @@ final class RasterizeTests: XCTestCase {
         ], [1, 3, 4])
         let tri = MLXArray([Int32(0), 1, 2], [1, 3])
 
-        let rast = DiffRast.rasterize(pos, tri: tri, resolution: (height: 2, width: 2))
+        let (rast, _) = DiffRast.rasterize(pos, tri: tri, resolution: (height: 2, width: 2), gradDB: false)
         XCTAssertEqual(rast.shape, [1, 2, 2, 4])
         let flat = rast.asArray(Float.self)
 
@@ -68,7 +68,7 @@ final class RasterizeTests: XCTestCase {
             Int32(3), 4, 5,
         ], [2, 3])
 
-        let rast = DiffRast.rasterize(pos, tri: tri, resolution: (height: 2, width: 2))
+        let (rast, _) = DiffRast.rasterize(pos, tri: tri, resolution: (height: 2, width: 2), gradDB: false)
         let flat = rast.asArray(Float.self)
 
         // Every pixel that's inside both should report tri 1 (tri_id+1 = 2) and z=-0.5.
@@ -94,7 +94,7 @@ final class RasterizeTests: XCTestCase {
             Float(-1.0),  0.5,  0, 1,
         ], [1, 3, 4])
         let tri = MLXArray([Int32(0), 1, 2], [1, 3])
-        let rast = DiffRast.rasterize(pos, tri: tri, resolution: (height: 4, width: 4))
+        let (rast, _) = DiffRast.rasterize(pos, tri: tri, resolution: (height: 4, width: 4), gradDB: false)
         let flat = rast.asArray(Float.self)
 
         // Bottom-right pixel (h=3, w=3) ndc ≈ (0.75, -0.75) is far outside.
@@ -103,6 +103,68 @@ final class RasterizeTests: XCTestCase {
         XCTAssertEqual(flat[base + 1], 0)
         XCTAssertEqual(flat[base + 2], 0)
         XCTAssertEqual(flat[base + 3], 0)
+    }
+
+    /// Pixel-derivative `rast_db` matches the analytic formula on a known triangle.
+    ///
+    /// Triangle: V0=(-1, 1), V1=(-1, -1), V2=(1, 1) at z=0, w=1. Image 2×2.
+    ///   sx0=-1, sy0= 1;  sx1=-1, sy1=-1;  sx2= 1, sy2= 1
+    ///   area = (sx1-sx0)*(sy2-sy0) - (sx2-sx0)*(sy1-sy0)
+    ///        = 0*0 - 2*(-2) = 4
+    ///   du/dx = (sy2-sy0)/area * (2/W)  = 0/4    * 1  = 0
+    ///   du/dy = (sx0-sx2)/area * (-2/H) = -2/4   * -1 = 0.5
+    ///   dv/dx = (sy0-sy1)/area * (2/W)  = 2/4    * 1  = 0.5
+    ///   dv/dy = (sx1-sx0)/area * (-2/H) = 0/4    * -1 = 0
+    func testRastDBAnalytic() {
+        let pos = MLXArray([
+            Float(-1),  1, 0, 1,
+            Float(-1), -1, 0, 1,
+            Float( 1),  1, 0, 1,
+        ], [1, 3, 4])
+        let tri = MLXArray([Int32(0), 1, 2], [1, 3])
+
+        let (_, rastDB) = DiffRast.rasterize(pos, tri: tri, resolution: (height: 2, width: 2))
+        XCTAssertEqual(rastDB.shape, [1, 2, 2, 4])
+        let flat = rastDB.asArray(Float.self)
+
+        // Check the three covered pixels (top-left, top-right, bottom-left).
+        let expected: [Float] = [0.0, 0.5, 0.5, 0.0]
+        for pixIdx in [0, 1, 2] {
+            for ch in 0..<4 {
+                XCTAssertEqual(flat[pixIdx * 4 + ch], expected[ch], accuracy: 1e-5,
+                               "pix \(pixIdx) channel \(ch)")
+            }
+        }
+        // Empty pixel (bottom-right) → all zeros.
+        for ch in 0..<4 {
+            XCTAssertEqual(flat[3 * 4 + ch], 0, accuracy: 1e-5)
+        }
+    }
+
+    /// End-to-end DA path: rasterize(gradDB=true) feeds rast_db into interpolate
+    /// with diffAttrs=.all, and the resulting out_da should match a hand-computed
+    /// value using the rast_db channels.
+    func testRasterizeIntoInterpolateDA() {
+        let pos = MLXArray([
+            Float(-1),  1, 0, 1,
+            Float(-1), -1, 0, 1,
+            Float( 1),  1, 0, 1,
+        ], [1, 3, 4])
+        let tri = MLXArray([Int32(0), 1, 2], [1, 3])
+        let (rast, rastDB) = DiffRast.rasterize(pos, tri: tri, resolution: (height: 2, width: 2))
+
+        // One scalar attr per vertex: a0=0, a1=2, a2=4 ⇒ d01=2, d02=4.
+        let attr = MLXArray([Float(0), 2, 4], [1, 3, 1])
+        let (_, outDA) = DiffRast.interpolate(
+            attr, rast: rast, tri: tri, rastDB: rastDB, diffAttrs: .all)
+        XCTAssertEqual(outDA.shape, [1, 2, 2, 2])
+
+        // rast_db at every covered pixel = (0, 0.5, 0.5, 0). With d01=2, d02=4:
+        //   dA/dx = d01 * du/dx + d02 * dv/dx = 2*0   + 4*0.5 = 2.0
+        //   dA/dy = d01 * du/dy + d02 * dv/dy = 2*0.5 + 4*0   = 1.0
+        let flat = outDA.asArray(Float.self)
+        XCTAssertEqual(flat[0], 2.0, accuracy: 1e-5)
+        XCTAssertEqual(flat[1], 1.0, accuracy: 1e-5)
     }
 
     /// Sanity: feeding the rast output into `interpolate` produces non-zero attrs
@@ -115,7 +177,7 @@ final class RasterizeTests: XCTestCase {
             Float( 1),  1, 0, 1,
         ], [1, 3, 4])
         let tri = MLXArray([Int32(0), 1, 2], [1, 3])
-        let rast = DiffRast.rasterize(pos, tri: tri, resolution: (height: 2, width: 2))
+        let (rast, _) = DiffRast.rasterize(pos, tri: tri, resolution: (height: 2, width: 2), gradDB: false)
 
         // Per-vertex color: v0 = red, v1 = green, v2 = blue.
         let attr = MLXArray([
