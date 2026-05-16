@@ -94,9 +94,35 @@ Metal-kernel note: template args (e.g. `BOUNDARY`) are NOT visible inside the
 in the header must take what they need as explicit parameters.
 
 ### M4 — `antialias`
-- [ ] `antialias_construct_topology_hash` — build edge hash from `tri`.
-- [ ] Forward: detect silhouette edges per pixel, blend across them.
-- [ ] Backward: gradient flows into `pos` (silhouette geometry) and `color`.
+
+#### M4.1 — Topology + API stub (✅ DONE)
+- [x] `antialiasConstructTopologyHash(tri:)` — full Swift implementation,
+      returns `[T, 3]` int32 neighbor table (`-1` for boundary edges).
+      O(T log T), pure CPU; cache alongside `tri`.
+- [x] `antialias(color:, rast:, pos:, tri:, topologyHash:)` API surface as a
+      CustomFunction. **Forward is currently identity; d_color is identity;
+      d_pos is zero.** Documented as a stub so callers can wire pipelines
+      now and upgrade transparently when M4.2 lands.
+
+#### M4.2 — Silhouette blend forward + color backward
+- [ ] Per-pixel kernel: walk right/down neighbors. For each pair with
+      differing tri-ids, identify the silhouette edge:
+        - if neighbor is empty (tri-id 0): scan the foreground triangle's 3
+          edges, pick the one whose neighbor (per topologyHash) is `-1`
+        - if both covered: pick the edge whose neighbor matches the other
+          pixel's tri-id
+- [ ] Sub-pixel coverage `α` from edge-line intersection with the pixel
+      midline in screen space.
+- [ ] Blend `out_fg = color_fg + α * (color_bg - color_fg)`.
+- [ ] VJP for `color`: atomic scatter `(1-α)` and `α` into the two pixels.
+
+#### M4.3 — `pos` backward (the killer-feature gradient)
+- [ ] `α` is a smooth function of the edge endpoint screen coords (which are
+      a perspective-divide of `pos`). Chain rule mirrors rasterize M2.3 but
+      runs through the line-intersection formula instead of barycentrics.
+- [ ] Gradcheck against MLX `grad` with a triangle whose silhouette crosses
+      pixel midlines without sitting *on* any midline (silhouette-edge
+      fixture hygiene — see `[[feedback-gradcheck-silhouettes]]`).
 
 ### M5 — Examples + docs
 - [ ] DocC catalog
