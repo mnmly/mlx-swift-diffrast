@@ -104,17 +104,25 @@ in the header must take what they need as explicit parameters.
       d_pos is zero.** Documented as a stub so callers can wire pipelines
       now and upgrade transparently when M4.2 lands.
 
-#### M4.2 — Silhouette blend forward + color backward
-- [ ] Per-pixel kernel: walk right/down neighbors. For each pair with
-      differing tri-ids, identify the silhouette edge:
-        - if neighbor is empty (tri-id 0): scan the foreground triangle's 3
-          edges, pick the one whose neighbor (per topologyHash) is `-1`
-        - if both covered: pick the edge whose neighbor matches the other
-          pixel's tri-id
-- [ ] Sub-pixel coverage `α` from edge-line intersection with the pixel
-      midline in screen space.
-- [ ] Blend `out_fg = color_fg + α * (color_bg - color_fg)`.
-- [ ] VJP for `color`: atomic scatter `(1-α)` and `α` into the two pixels.
+#### M4.2 — Silhouette blend forward + color backward (✅ DONE)
+- [x] Per-pixel kernel walks all 4 neighbors; bg-side-only convention removes
+      atomics from the forward
+- [x] Topology-hash lookup to validate silhouettes (true silhouettes vs
+      depth/overlap discontinuities)
+- [x] Sub-pixel coverage `α` from edge-line intersection with the pixel's
+      row/column centerline in screen-pixel space
+- [x] Forward blend: `out_p = color_p + Σ_dir α_dir · (color_n - color_p)`
+- [x] d_color via atomic scatter — `(1 - Σα)` to self, `α_dir` to each
+      contributing neighbor
+- [x] Gradcheck d_color against MLX `grad` + finite differences
+
+Metal-source lesson worth flagging: when sharing helper logic between
+multiple JIT-compiled kernels via MLXFast, **inline the code** through a
+Swift string-template substitution rather than via Metal preprocessor
+macros or header-defined inline functions. Macro line-continuations and
+the `constant`/`device` qualifier matching on kernel-input pointers are
+both fragile across the Swift→Metal source boundary. See
+`silhouetteBlock` in `Antialias.swift` for the working pattern.
 
 #### M4.3 — `pos` backward (the killer-feature gradient)
 - [ ] `α` is a smooth function of the edge endpoint screen coords (which are
