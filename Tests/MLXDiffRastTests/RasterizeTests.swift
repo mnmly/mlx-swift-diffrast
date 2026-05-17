@@ -245,6 +245,66 @@ final class RasterizeTests: XCTestCase {
         }
     }
 
+    // MARK: - Depth peeling
+
+    /// Two coplanar triangles at different depths. First rasterize → closer
+    /// triangle. Pass that result as `peelLayer:` → second call peels through
+    /// and returns the farther triangle.
+    func testPeelLayerExposesNextDepth() {
+        // tri 0 at z = -0.5 (closer), tri 1 at z = 0.5 (farther). Both cover
+        // the entire image (vertices outside the [-1, 1] box).
+        let pos = MLXArray([
+            Float(-2),  2, -0.5, 1,
+            Float(-2), -2, -0.5, 1,
+            Float( 2),  2, -0.5, 1,
+            Float(-2),  2,  0.5, 1,
+            Float(-2), -2,  0.5, 1,
+            Float( 2),  2,  0.5, 1,
+        ], [1, 6, 4])
+        let tri = MLXArray([
+            Int32(0), 1, 2,
+            Int32(3), 4, 5,
+        ], [2, 3])
+
+        let (layer0, _) = DiffRast.rasterize(
+            pos, tri: tri, resolution: (height: 2, width: 2), gradDB: false)
+        let f0 = layer0.asArray(Float.self)
+        // Front (tri 0): z = -0.5, tri_id+1 = 1.
+        for h in 0..<2 {
+            for w in 0..<2 {
+                let base = (h * 2 + w) * 4
+                if f0[base + 3] == 0 { continue }
+                XCTAssertEqual(f0[base + 2], -0.5, accuracy: 1e-5)
+                XCTAssertEqual(f0[base + 3],  1.0, accuracy: 1e-5)
+            }
+        }
+
+        let (layer1, _) = DiffRast.rasterize(
+            pos, tri: tri, resolution: (height: 2, width: 2), gradDB: false,
+            peelLayer: layer0)
+        let f1 = layer1.asArray(Float.self)
+        // Peeled: front layer (tri 0) skipped, so we see tri 1 (z = 0.5).
+        for h in 0..<2 {
+            for w in 0..<2 {
+                let base = (h * 2 + w) * 4
+                if f1[base + 3] == 0 { continue }
+                XCTAssertEqual(f1[base + 2], 0.5, accuracy: 1e-5,
+                               "(h=\(h),w=\(w)) peel should expose z=0.5")
+                XCTAssertEqual(f1[base + 3], 2.0, accuracy: 1e-5,
+                               "(h=\(h),w=\(w)) peel should show tri 1 (id+1 = 2)")
+            }
+        }
+
+        // Third peel → nothing behind tri 1 → all empty.
+        let (layer2, _) = DiffRast.rasterize(
+            pos, tri: tri, resolution: (height: 2, width: 2), gradDB: false,
+            peelLayer: layer1)
+        let f2 = layer2.asArray(Float.self)
+        for i in 0..<4 {
+            XCTAssertEqual(f2[i * 4 + 3], 0, "third layer should be empty")
+        }
+    }
+
     // MARK: - Range mode
 
     /// Two triangles in the same `tri` buffer, different batches each render

@@ -102,8 +102,17 @@ from any given pixel.
 - [x] Differentiable through MLX's broadcast-backward — gradient flows back to
       the shared `[V, 4]` buffer correctly (summed over batches)
 
+#### M2.6 — Depth peeling (✅ DONE)
+- [x] `peelLayer: MLXArray?` parameter on `rasterize`. Pass a previous-layer
+      output to peel through it: triangles whose pixel z is ≤ the layer's z
+      are skipped. Empty pixels in the previous layer (`tri_id+1 == 0`)
+      contribute `z = -∞` so all triangles compete normally.
+- [x] `PEEL: Bool` template flag on `fwd` / `fwd_db` kernels — non-peel path
+      is the existing kernel with the flag false, no runtime overhead.
+- [x] Backward unchanged (per-pixel winner lookup from `rast[3]` works the
+      same regardless of which layer was selected).
+
 #### Deferred
-- [ ] `DepthPeeler` analog for transparency / multi-layer rendering
 - [ ] True per-tile bin lists (one allocator pass + one rasterize pass) — the
       next step beyond AABB rejection when triangle counts go past ~10⁴ and
       the per-triangle screen reads start to dominate.

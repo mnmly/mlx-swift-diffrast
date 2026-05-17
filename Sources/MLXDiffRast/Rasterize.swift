@@ -32,13 +32,22 @@ extension DiffRast {
     /// Differentiable w.r.t. `pos` in both modes. In range mode the gradient
     /// flows back through MLX's automatic broadcast-backward to the shared
     /// `[V, 4]` vertex buffer (summed across batches).
+    ///
+    /// **Depth peeling**: pass the rast output from a previous call as
+    /// `peelLayer:`. Triangles whose interpolated z is `≤` the previous
+    /// layer's z are skipped, so chained `rasterize` calls peel through
+    /// scene depth in order. The previous layer's empty pixels (tri_id+1=0)
+    /// are treated as `z = -∞` so all triangles compete normally. Useful for
+    /// rendering transparent / multi-layer scenes one front-to-back layer at
+    /// a time.
     @discardableResult
     public static func rasterize(
         _ pos: MLXArray,
         tri: MLXArray,
         resolution: (height: Int, width: Int),
         gradDB: Bool = true,
-        ranges: MLXArray? = nil
+        ranges: MLXArray? = nil,
+        peelLayer: MLXArray? = nil
     ) -> (rast: MLXArray, rastDB: MLXArray) {
         precondition(tri.ndim == 2 && tri.shape[1] == 3,
                      "rasterize: tri must be [T, 3] (got \(tri.shape))")
@@ -78,15 +87,30 @@ extension DiffRast {
             rangesArr = MLXArray(defaultRanges, [N, 2])
         }
 
+        // Peel layer plumbing. The kernels always read a `peel_layer` input
+        // but only act on it when the PEEL template flag is true.
+        let peelEnabled = peelLayer != nil
+        let peelArr: MLXArray
+        if let layer = peelLayer {
+            precondition(layer.ndim == 4 && layer.shape[3] == 4
+                         && layer.shape[0] == N && layer.shape[1] == H && layer.shape[2] == W,
+                         "rasterize: peelLayer must match rast shape [N, H, W, 4] (got \(layer.shape))")
+            peelArr = layer
+        } else {
+            peelArr = MLXArray.zeros([1], dtype: .float32)
+        }
+
         if !gradDB {
             let fwd: ([MLXArray]) -> [MLXArray] = { inputs in
                 [Self.rasterizeForwardKernel(pos: inputs[0], tri: triI32, ranges: rangesArr,
+                                             peelLayer: peelArr, peelEnabled: peelEnabled,
                                              N: N, V: V, T: T, H: H, W: W)]
             }
             let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
                 let dPos = Self.rasterizeBackwardKernel(
                     pos: primals[0], tri: triI32,
-                    rast: forwardRastForBwd(primals[0], triI32, rangesArr, N, V, T, H, W),
+                    rast: forwardRastForBwd(primals[0], triI32, rangesArr,
+                                            peelArr, peelEnabled, N, V, T, H, W),
                     dRast: cotangents[0],
                     dRastDB: MLXArray.zeros([N, H, W, 4], dtype: .float32),
                     N: N, V: V, H: H, W: W)
@@ -98,12 +122,14 @@ extension DiffRast {
         } else {
             let fwd: ([MLXArray]) -> [MLXArray] = { inputs in
                 let (r, db) = Self.rasterizeForwardDBKernel(pos: inputs[0], tri: triI32, ranges: rangesArr,
+                                                           peelLayer: peelArr, peelEnabled: peelEnabled,
                                                            N: N, V: V, T: T, H: H, W: W)
                 return [r, db]
             }
             let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
                 let (r, _) = Self.rasterizeForwardDBKernel(
                     pos: primals[0], tri: triI32, ranges: rangesArr,
+                    peelLayer: peelArr, peelEnabled: peelEnabled,
                     N: N, V: V, T: T, H: H, W: W)
                 let dPos = Self.rasterizeBackwardKernel(
                     pos: primals[0], tri: triI32, rast: r,
@@ -122,9 +148,12 @@ extension DiffRast {
     /// recompute. Cheap relative to the backward itself.
     private static func forwardRastForBwd(
         _ pos: MLXArray, _ tri: MLXArray, _ ranges: MLXArray,
+        _ peelLayer: MLXArray, _ peelEnabled: Bool,
         _ N: Int, _ V: Int, _ T: Int, _ H: Int, _ W: Int
     ) -> MLXArray {
-        rasterizeForwardKernel(pos: pos, tri: tri, ranges: ranges, N: N, V: V, T: T, H: H, W: W)
+        rasterizeForwardKernel(pos: pos, tri: tri, ranges: ranges,
+                               peelLayer: peelLayer, peelEnabled: peelEnabled,
+                               N: N, V: V, T: T, H: H, W: W)
     }
 
     // MARK: - Precompute (per-triangle screen-space data)
@@ -242,6 +271,16 @@ extension DiffRast {
         float ndc_x = 2.0f * ((float)pw + 0.5f) / (float)W - 1.0f;
         float ndc_y = 1.0f - 2.0f * ((float)ph + 0.5f) / (float)H;
 
+        // Depth-peel threshold: only consider triangles with z > peel_z.
+        // Empty pixels in the previous layer (tri_id+1 == 0) get -∞ so all
+        // triangles are eligible.
+        float peel_z = -1e30f;
+        if (PEEL) {
+            uint peel_base = ((pn * (uint)H + ph) * (uint)W + pw) * 4u;
+            float prev_tri = peel_layer[peel_base + 3];
+            if (prev_tri > 0.0f) peel_z = peel_layer[peel_base + 2];
+        }
+
         float best_z = 1e30f;
         int   best_t = -1;
         float best_u = 0.0f;
@@ -290,6 +329,7 @@ extension DiffRast {
             // Screen-space linear z (matches nvdiffrast's stored z/w channel).
             float z_pix = bw * sz0 + u * sz1 + v * sz2;
             if (z_pix < -1.0f || z_pix > 1.0f) continue;
+            if (z_pix <= peel_z) continue;
             if (z_pix >= best_z) continue;
 
             best_z = z_pix;
@@ -332,6 +372,13 @@ extension DiffRast {
         float ndc_x = 2.0f * ((float)pw + 0.5f) / (float)W - 1.0f;
         float ndc_y = 1.0f - 2.0f * ((float)ph + 0.5f) / (float)H;
 
+        float peel_z = -1e30f;
+        if (PEEL) {
+            uint peel_base = ((pn * (uint)H + ph) * (uint)W + pw) * 4u;
+            float prev_tri = peel_layer[peel_base + 3];
+            if (prev_tri > 0.0f) peel_z = peel_layer[peel_base + 2];
+        }
+
         float best_z = 1e30f;
         int   best_t = -1;
         float best_u = 0.0f;
@@ -368,6 +415,7 @@ extension DiffRast {
 
             float z_pix = bw * sz0 + u * sz1 + v * sz2;
             if (z_pix < -1.0f || z_pix > 1.0f) continue;
+            if (z_pix <= peel_z) continue;
             if (z_pix >= best_z) continue;
 
             best_z = z_pix;
@@ -414,12 +462,12 @@ extension DiffRast {
 
     private static let fwdKernel = MLXFast.metalKernel(
         name: "diffrast_rasterize_fwd",
-        inputNames: ["screen_data"], outputNames: ["out"],
+        inputNames: ["screen_data", "peel_layer"], outputNames: ["out"],
         source: fwdSource)
 
     private static let fwdDBKernel = MLXFast.metalKernel(
         name: "diffrast_rasterize_fwd_db",
-        inputNames: ["screen_data"], outputNames: ["out", "out_db"],
+        inputNames: ["screen_data", "peel_layer"], outputNames: ["out", "out_db"],
         source: fwdDBSource)
 
     // MARK: - Backward kernel (M2.3)
@@ -636,6 +684,7 @@ extension DiffRast {
 
     private static func rasterizeForwardKernel(
         pos: MLXArray, tri: MLXArray, ranges: MLXArray,
+        peelLayer: MLXArray, peelEnabled: Bool,
         N: Int, V: Int, T: Int, H: Int, W: Int
     ) -> MLXArray {
         let screen = rasterizePrecompute(pos: pos, tri: tri, ranges: ranges,
@@ -643,8 +692,9 @@ extension DiffRast {
         let pixels = N * H * W
         let rounded = ((pixels + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         return fwdKernel(
-            [screen],
-            template: [("N", N), ("V", V), ("T", T), ("H", H), ("W", W)],
+            [screen, peelLayer],
+            template: [("N", N), ("V", V), ("T", T), ("H", H), ("W", W),
+                       ("PEEL", peelEnabled)],
             grid: (rounded, 1, 1),
             threadGroup: (rasterizeTG, 1, 1),
             outputShapes: [[N, H, W, 4]],
@@ -672,6 +722,7 @@ extension DiffRast {
 
     private static func rasterizeForwardDBKernel(
         pos: MLXArray, tri: MLXArray, ranges: MLXArray,
+        peelLayer: MLXArray, peelEnabled: Bool,
         N: Int, V: Int, T: Int, H: Int, W: Int
     ) -> (MLXArray, MLXArray) {
         let screen = rasterizePrecompute(pos: pos, tri: tri, ranges: ranges,
@@ -679,8 +730,9 @@ extension DiffRast {
         let pixels = N * H * W
         let rounded = ((pixels + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         let outs = fwdDBKernel(
-            [screen],
-            template: [("N", N), ("V", V), ("T", T), ("H", H), ("W", W)],
+            [screen, peelLayer],
+            template: [("N", N), ("V", V), ("T", T), ("H", H), ("W", W),
+                       ("PEEL", peelEnabled)],
             grid: (rounded, 1, 1),
             threadGroup: (rasterizeTG, 1, 1),
             outputShapes: [[N, H, W, 4], [N, H, W, 4]],
