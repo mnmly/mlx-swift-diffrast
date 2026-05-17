@@ -124,13 +124,20 @@ the `constant`/`device` qualifier matching on kernel-input pointers are
 both fragile across the Swift→Metal source boundary. See
 `silhouetteBlock` in `Antialias.swift` for the working pattern.
 
-#### M4.3 — `pos` backward (the killer-feature gradient)
-- [ ] `α` is a smooth function of the edge endpoint screen coords (which are
-      a perspective-divide of `pos`). Chain rule mirrors rasterize M2.3 but
-      runs through the line-intersection formula instead of barycentrics.
-- [ ] Gradcheck against MLX `grad` with a triangle whose silhouette crosses
-      pixel midlines without sitting *on* any midline (silhouette-edge
-      fixture hygiene — see `[[feedback-gradcheck-silhouettes]]`).
+#### M4.3 — `pos` backward (✅ DONE — the killer-feature gradient)
+- [x] Chain rule:
+        `d_loss/d_α` → `d_α/d_(xe|ye)` → `d_(xe|ye)/d_e{0,1}` (line-intersection
+        partials) → `d_e/d_pos` (perspective-divide partials)
+- [x] Single new kernel `bwdPos` reusing the `silhouetteBlock` per-direction
+      stash; both endpoint vertices receive atomic scatter contributions per
+      silhouette direction
+- [x] `α` saturation handled correctly — gradient zeroed when α clipped to
+      0 or 1 (mirrors the analytic derivative of the clamp)
+- [x] Gradcheck against MLX `grad` + central FD on a quad fixture
+      (two triangles share an interior edge → topology lookups unambiguous;
+      `rast` precomputed once outside the loss to fix coverage)
+- [x] Non-triviality check confirming the gradient path actually fires
+      (at least one pos element receives a non-zero gradient)
 
 ### M5 — Examples + docs
 - [ ] DocC catalog

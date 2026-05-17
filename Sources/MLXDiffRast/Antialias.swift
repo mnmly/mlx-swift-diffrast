@@ -54,7 +54,7 @@ extension DiffRast {
         return MLXArray(neighbor, [T, 3])
     }
 
-    /// Silhouette-aware antialiasing — M4.2 (forward + d_color backward).
+    /// Silhouette-aware antialiasing — fully differentiable.
     ///
     /// For each pair of 4-connected pixels, if their `rast` tri-ids identify a
     /// *true silhouette* (validated by `topologyHash`), the foreground
@@ -65,11 +65,13 @@ extension DiffRast {
     /// Each pair contributes to at most one pixel; per-direction contributions
     /// compose additively if the same pixel borders multiple silhouettes.
     ///
-    /// **Differentiability (M4.2 status):** cotangents flow through `color`
-    /// correctly (atomic scatter with the same `α`). `d_pos` is still **zero**.
-    /// The chain rule from `α` back through the edge-line intersection into
-    /// `pos` is the focus of M4.3 — it mirrors rasterize's M2.3 in shape but
-    /// runs through line-intersection algebra instead of barycentrics.
+    /// Differentiable w.r.t. both `color` and `pos`. The `pos` gradient flows
+    /// through the line-intersection formula and the perspective divide back
+    /// into clip-space vertex positions — closing the loop for inverse-
+    /// rendering pipelines that optimize geometry against a pixel-space loss.
+    /// `α` saturates (clipped to `[0, 1]`) on the boundary; gradients are zero
+    /// outside the interior of that interval, which is the analytically correct
+    /// behavior for the clamped silhouette.
     ///
     /// If `topologyHash` is `nil` it will be computed via
     /// `antialiasConstructTopologyHash(tri)`; pass a cached value when
@@ -107,7 +109,11 @@ extension DiffRast {
                 color: primals[0], rast: rast, pos: primals[1],
                 tri: triI32, topology: hashI32, dOut: cotangents[0],
                 N: N, H: H, W: W, C: C, T: T, V: V)
-            return [dColor, MLXArray.zeros(primals[1].shape, dtype: .float32)]
+            let dPos = Self.antialiasBackwardPosKernel(
+                color: primals[0], rast: rast, pos: primals[1],
+                tri: triI32, topology: hashI32, dOut: cotangents[0],
+                N: N, H: H, W: W, C: C, T: T, V: V)
+            return [dColor, dPos]
         }
         let custom = CustomFunction { Forward(fwd); VJP(vjp) }
         return custom([color, pos])[0]
@@ -124,17 +130,30 @@ extension DiffRast {
         struct PixelXY { float x; float y; };
     """
 
-    /// Reused once each in `fwdSource` and `bwdColorSource` — kept as a Swift
-    /// constant so the silhouette logic stays single-source.
+    /// Reused once each in `fwdSource`, `bwdColorSource`, and `bwdPosSource`.
+    /// Stashes per-direction state (α, neighbor color base, edge endpoints,
+    /// parameter t, denominator, sign) used by the pos backward; forward and
+    /// color backward consume only a subset (the rest gets DCE'd).
     private static let silhouetteBlock = """
         int tri_p = (int)rast[rast_base + 3] - 1;
         uint pos_n_base = pn * (uint)V * 4u;
 
-        // Per-direction outputs filled in below; consumed by the kernel body.
         float alpha_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         uint  nbase_arr[4] = {0u, 0u, 0u, 0u};
         bool  active_arr[4] = {false, false, false, false};
         float alpha_sum_local = 0.0f;
+
+        // Extended state — used by bwdPos. DCE-friendly when unused.
+        int   i_e0_arr[4] = {-1, -1, -1, -1};
+        int   i_e1_arr[4] = {-1, -1, -1, -1};
+        float e0x_arr[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
+        float e0y_arr[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
+        float e1x_arr[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
+        float e1y_arr[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
+        float t_arr[4]    = {0.0f, 0.0f, 0.0f, 0.0f};
+        float denom_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // dy (horizontal) or dx (vertical)
+        float dalpha_dxy_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // d_α / d_xe (or d_ye)
+        bool  is_horiz_arr[4] = {false, false, false, false};
 
         for (int dir = 0; dir < 4; ++dir) {
             int dh = 0, dw = 0;
@@ -156,7 +175,6 @@ extension DiffRast {
             int fg_tri, target;
             bool p_is_bg;
             if (tri_p >= 0 && tri_n >= 0) {
-                // Both covered: silhouette only if they share an edge.
                 int k_at_p = -1;
                 if (topology[tri_p * 3 + 0] == tri_n) k_at_p = 0;
                 else if (topology[tri_p * 3 + 1] == tri_n) k_at_p = 1;
@@ -179,7 +197,6 @@ extension DiffRast {
             int i_e0 = tri[fg_tri * 3 + ((k + 1) % 3)];
             int i_e1 = tri[fg_tri * 3 + ((k + 2) % 3)];
 
-            // Project edge endpoints to pixel-space (perspective divide + NDC mapping).
             float w0 = pos[pos_n_base + (uint)i_e0 * 4u + 3];
             float w1 = pos[pos_n_base + (uint)i_e1 * 4u + 3];
             PixelXY e0, e1;
@@ -189,35 +206,55 @@ extension DiffRast {
             e1.y = (1.0f - pos[pos_n_base + (uint)i_e1 * 4u + 1] / w1) * (float)H * 0.5f - 0.5f;
 
             float alpha = 0.0f;
-            if (dh == 0) {
-                // Horizontal pair: pw_p = left pixel column.
+            float t_val = 0.0f;
+            float denom = 0.0f;
+            float dalpha_dxy = 0.0f;
+            bool is_horiz = (dh == 0);
+
+            if (is_horiz) {
                 int pw_p = dw > 0 ? (int)pw : (int)pw - 1;
                 float fg_center_x = (float)(pw_p == (int)pw ? nw : pw) + 0.5f;
                 float dyv = e1.y - e0.y;
+                denom = dyv;
                 if (fabs(dyv) >= 1e-7f) {
                     float row_y = (float)ph + 0.5f;
-                    float t = (row_y - e0.y) / dyv;
-                    if (t >= 0.0f && t <= 1.0f) {
-                        float xe = e0.x + t * (e1.x - e0.x);
+                    float tval = (row_y - e0.y) / dyv;
+                    t_val = tval;
+                    if (tval >= 0.0f && tval <= 1.0f) {
+                        float xe = e0.x + tval * (e1.x - e0.x);
                         float pl = (float)pw;
                         float pr = (float)(pw + 1);
                         float clipped = fmin(fmax(xe, pl), pr);
-                        alpha = (fg_center_x > xe) ? (pr - clipped) : (clipped - pl);
+                        if (fg_center_x > xe) {
+                            alpha = pr - clipped;
+                            dalpha_dxy = -1.0f;
+                        } else {
+                            alpha = clipped - pl;
+                            dalpha_dxy = 1.0f;
+                        }
                     }
                 }
             } else {
                 int ph_p = dh > 0 ? (int)ph : (int)ph - 1;
                 float fg_center_y = (float)(ph_p == (int)ph ? nh : ph) + 0.5f;
                 float dxv = e1.x - e0.x;
+                denom = dxv;
                 if (fabs(dxv) >= 1e-7f) {
                     float col_x = (float)pw + 0.5f;
-                    float t = (col_x - e0.x) / dxv;
-                    if (t >= 0.0f && t <= 1.0f) {
-                        float ye = e0.y + t * (e1.y - e0.y);
+                    float tval = (col_x - e0.x) / dxv;
+                    t_val = tval;
+                    if (tval >= 0.0f && tval <= 1.0f) {
+                        float ye = e0.y + tval * (e1.y - e0.y);
                         float pt = (float)ph;
                         float pb = (float)(ph + 1);
                         float clipped = fmin(fmax(ye, pt), pb);
-                        alpha = (fg_center_y > ye) ? (pb - clipped) : (clipped - pt);
+                        if (fg_center_y > ye) {
+                            alpha = pb - clipped;
+                            dalpha_dxy = -1.0f;
+                        } else {
+                            alpha = clipped - pt;
+                            dalpha_dxy = 1.0f;
+                        }
                     }
                 }
             }
@@ -228,6 +265,15 @@ extension DiffRast {
             nbase_arr[dir] = ((pn * (uint)H + (uint)nh) * (uint)W + (uint)nw) * (uint)C;
             active_arr[dir] = true;
             alpha_sum_local += alpha;
+
+            i_e0_arr[dir] = i_e0;
+            i_e1_arr[dir] = i_e1;
+            e0x_arr[dir] = e0.x; e0y_arr[dir] = e0.y;
+            e1x_arr[dir] = e1.x; e1y_arr[dir] = e1.y;
+            t_arr[dir] = t_val;
+            denom_arr[dir] = denom;
+            dalpha_dxy_arr[dir] = dalpha_dxy;
+            is_horiz_arr[dir] = is_horiz;
         }
     """
 
@@ -271,6 +317,136 @@ extension DiffRast {
     ///
     /// The first term is local to p (non-atomic). The second term writes to
     /// neighbor positions, so we use atomic scatter-add into d_color.
+    /// Backward for `d_pos`. Active when α ∈ (0, 1) (interior, non-saturated);
+    /// outside that range `α` is clipped by min/max and contributes no
+    /// gradient. Chain rule:
+    ///
+    ///   d_α/d_e0.x = dalpha_dxy · (1 - t)      (horizontal)
+    ///   d_α/d_e1.x = dalpha_dxy · t
+    ///   d_α/d_e0.y = dalpha_dxy · (e1.x - e0.x) · (row_y - e1.y) / dy²
+    ///   d_α/d_e1.y = dalpha_dxy · -(e1.x - e0.x) · (row_y - e0.y) / dy²
+    ///
+    /// (Vertical pairs swap x ↔ y and `row_y` ↔ `col_x`.)
+    ///
+    /// Then chain through perspective divide for each endpoint vertex v:
+    ///   d_e.x/d_pos[v, 0] =  W/2 / w_v
+    ///   d_e.x/d_pos[v, 3] = -W/2 · nd_x / w_v
+    ///   d_e.y/d_pos[v, 1] = -H/2 / w_v
+    ///   d_e.y/d_pos[v, 3] =  H/2 · nd_y / w_v
+    ///   d_e.{x,y}/d_pos[v, 2] = 0   (z doesn't affect screen position)
+    ///
+    /// `d_loss/d_pos` = `d_loss/d_α` · `d_α/d_pos`, with
+    ///   `d_loss/d_α = Σ_c d_out_p[c] · (color_n[c] - color_p[c])`.
+    private static var bwdPosSource: String { """
+        uint pix = thread_position_in_grid.x;
+        uint total = (uint)N * (uint)H * (uint)W;
+        if (pix >= total) return;
+
+        uint pw = pix % (uint)W;
+        uint ph = (pix / (uint)W) % (uint)H;
+        uint pn = pix / ((uint)H * (uint)W);
+
+        uint rast_base = ((pn * (uint)H + ph) * (uint)W + pw) * 4u;
+        uint color_base = ((pn * (uint)H + ph) * (uint)W + pw) * (uint)C;
+
+        \(silhouetteBlock)
+
+        float halfW = (float)W * 0.5f;
+        float halfH = (float)H * 0.5f;
+
+        for (int dir = 0; dir < 4; ++dir) {
+            if (!active_arr[dir]) continue;
+            float alpha = alpha_arr[dir];
+            // Skip saturated (clipped) α — d_α is zero through the clamp.
+            if (alpha <= 0.0f || alpha >= 1.0f) continue;
+
+            // d_loss/d_α from upstream cotangents.
+            float d_alpha = 0.0f;
+            uint nb = nbase_arr[dir];
+            for (int c = 0; c < C; ++c) {
+                float cp = color[color_base + (uint)c];
+                float cn = color[nb + (uint)c];
+                float g  = d_out[color_base + (uint)c];
+                d_alpha += g * (cn - cp);
+            }
+            if (d_alpha == 0.0f) continue;
+
+            float e0x = e0x_arr[dir], e0y = e0y_arr[dir];
+            float e1x = e1x_arr[dir], e1y = e1y_arr[dir];
+            float t   = t_arr[dir];
+            float denom = denom_arr[dir];
+            float dalpha_dxy = dalpha_dxy_arr[dir];
+            bool  is_horiz = is_horiz_arr[dir];
+
+            float dade0x, dade0y, dade1x, dade1y;
+            if (is_horiz) {
+                float row_y = (float)ph + 0.5f;
+                float ex_diff = e1x - e0x;
+                float inv_denom_sq = 1.0f / (denom * denom);
+                dade0x = dalpha_dxy * (1.0f - t);
+                dade1x = dalpha_dxy * t;
+                dade0y = dalpha_dxy * ex_diff * (row_y - e1y) * inv_denom_sq;
+                dade1y = dalpha_dxy * (-ex_diff) * (row_y - e0y) * inv_denom_sq;
+            } else {
+                float col_x = (float)pw + 0.5f;
+                float ey_diff = e1y - e0y;
+                float inv_denom_sq = 1.0f / (denom * denom);
+                dade0y = dalpha_dxy * (1.0f - t);
+                dade1y = dalpha_dxy * t;
+                dade0x = dalpha_dxy * ey_diff * (col_x - e1x) * inv_denom_sq;
+                dade1x = dalpha_dxy * (-ey_diff) * (col_x - e0x) * inv_denom_sq;
+            }
+
+            // Chain through perspective divide for each endpoint and scatter
+            // into d_pos. Vertex 0:
+            int iv0 = i_e0_arr[dir];
+            {
+                float wv = pos[pos_n_base + (uint)iv0 * 4u + 3];
+                float inv_w = 1.0f / wv;
+                float nd_x = pos[pos_n_base + (uint)iv0 * 4u + 0] * inv_w;
+                float nd_y = pos[pos_n_base + (uint)iv0 * 4u + 1] * inv_w;
+
+                float d_px = d_alpha * dade0x * halfW * inv_w;
+                float d_py = d_alpha * dade0y * (-halfH) * inv_w;
+                float d_pw = d_alpha *
+                    (dade0x * (-halfW * nd_x) + dade0y * (halfH * nd_y)) * inv_w;
+
+                atomic_fetch_add_explicit(
+                    &d_pos[pos_n_base + (uint)iv0 * 4u + 0], d_px,
+                    memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &d_pos[pos_n_base + (uint)iv0 * 4u + 1], d_py,
+                    memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &d_pos[pos_n_base + (uint)iv0 * 4u + 3], d_pw,
+                    memory_order_relaxed);
+            }
+            // Vertex 1:
+            int iv1 = i_e1_arr[dir];
+            {
+                float wv = pos[pos_n_base + (uint)iv1 * 4u + 3];
+                float inv_w = 1.0f / wv;
+                float nd_x = pos[pos_n_base + (uint)iv1 * 4u + 0] * inv_w;
+                float nd_y = pos[pos_n_base + (uint)iv1 * 4u + 1] * inv_w;
+
+                float d_px = d_alpha * dade1x * halfW * inv_w;
+                float d_py = d_alpha * dade1y * (-halfH) * inv_w;
+                float d_pw = d_alpha *
+                    (dade1x * (-halfW * nd_x) + dade1y * (halfH * nd_y)) * inv_w;
+
+                atomic_fetch_add_explicit(
+                    &d_pos[pos_n_base + (uint)iv1 * 4u + 0], d_px,
+                    memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &d_pos[pos_n_base + (uint)iv1 * 4u + 1], d_py,
+                    memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &d_pos[pos_n_base + (uint)iv1 * 4u + 3], d_pw,
+                    memory_order_relaxed);
+            }
+        }
+    """ }
+
     private static var bwdColorSource: String { """
         uint pix = thread_position_in_grid.x;
         uint total = (uint)N * (uint)H * (uint)W;
@@ -314,6 +490,13 @@ extension DiffRast {
         source: bwdColorSource, header: aaHeader,
         atomicOutputs: true)
 
+    private static let bwdPosKernel = MLXFast.metalKernel(
+        name: "diffrast_antialias_bwd_pos",
+        inputNames: ["color", "rast", "pos", "tri", "topology", "d_out"],
+        outputNames: ["d_pos"],
+        source: bwdPosSource, header: aaHeader,
+        atomicOutputs: true)
+
     private static let aaTG = 256
 
     private static func aaTmpl(N: Int, H: Int, W: Int, C: Int, T: Int, V: Int)
@@ -348,6 +531,22 @@ extension DiffRast {
             template: aaTmpl(N: N, H: H, W: W, C: C, T: T, V: V),
             grid: (rounded, 1, 1), threadGroup: (aaTG, 1, 1),
             outputShapes: [[N, H, W, C]], outputDTypes: [.float32],
+            initValue: 0.0
+        )[0]
+    }
+
+    private static func antialiasBackwardPosKernel(
+        color: MLXArray, rast: MLXArray, pos: MLXArray, tri: MLXArray, topology: MLXArray,
+        dOut: MLXArray,
+        N: Int, H: Int, W: Int, C: Int, T: Int, V: Int
+    ) -> MLXArray {
+        let pixels = N * H * W
+        let rounded = ((pixels + aaTG - 1) / aaTG) * aaTG
+        return bwdPosKernel(
+            [color, rast, pos, tri, topology, dOut],
+            template: aaTmpl(N: N, H: H, W: W, C: C, T: T, V: V),
+            grid: (rounded, 1, 1), threadGroup: (aaTG, 1, 1),
+            outputShapes: [[N, V, 4]], outputDTypes: [.float32],
             initValue: 0.0
         )[0]
     }

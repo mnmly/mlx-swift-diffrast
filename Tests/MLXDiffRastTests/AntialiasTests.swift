@@ -183,17 +183,78 @@ final class AntialiasTests: XCTestCase {
         }
     }
 
-    /// M4.3 placeholder: d_pos should remain zero until the silhouette
-    /// gradient is implemented.
-    func testPosGradientIsCurrentlyZero() {
-        let N = 1, H = 3, W = 3, C = 1
+    // MARK: - M4.3 silhouette pos gradient
+
+    /// A quad (two triangles sharing a diagonal). Multiple boundary edges plus
+    /// the interior shared edge make `topologyHash` lookups unambiguous, which
+    /// matters for clean silhouette-edge selection in the kernel.
+    ///
+    /// Vertices placed off pixel centers so perturbations of size `eps` don't
+    /// flip rasterize coverage (`rast` is precomputed once outside the loss).
+    private func quadFixture() -> (pos: MLXArray, tri: MLXArray) {
+        // NDC quad spanning roughly [-0.45, +0.55]² (off-center on purpose).
         let pos = MLXArray([
-            Float(-3),  3, 0, 1,
-            Float(-3), -2.7, 0, 1,
-            Float( 2.7), 3, 0, 1,
-        ], [1, 3, 4])
-        let tri = MLXArray([Int32(0), 1, 2], [1, 3])
-        let (rast, _) = DiffRast.rasterize(pos, tri: tri,
+            Float(-0.45),  0.55, 0, 1,
+            Float( 0.55),  0.55, 0, 1,
+            Float( 0.55), -0.45, 0, 1,
+            Float(-0.45), -0.45, 0, 1,
+        ], [1, 4, 4])
+        let tri = MLXArray([
+            Int32(0), 1, 2,
+            Int32(0), 2, 3,
+        ], [2, 3])
+        return (pos, tri)
+    }
+
+    func testGradcheckPos() throws {
+        let N = 1, H = 4, W = 4, C = 2
+        let (pos0, tri) = quadFixture()
+        let hash = DiffRast.antialiasConstructTopologyHash(tri)
+        // Rasterize ONCE with the unperturbed pos. Inside the loss, rast is
+        // captured by value — so when FD perturbs `pos`, coverage stays fixed
+        // and only the silhouette-edge projection (the differentiable path
+        // through `pos` inside antialias) responds.
+        let (rast, _) = DiffRast.rasterize(pos0, tri: tri,
+                                           resolution: (height: H, width: W),
+                                           gradDB: false)
+
+        let color = MLXArray((0..<(N * H * W * C)).map { Float($0) * 0.3 + 1 },
+                             [N, H, W, C])
+        let wOut = MLXArray((0..<(N * H * W * C)).map { Float(1 + $0 % 5) * 0.1 },
+                            [N, H, W, C])
+
+        let loss: (MLXArray) -> MLXArray = { p in
+            (DiffRast.antialias(color: color, rast: rast, pos: p, tri: tri,
+                                topologyHash: hash) * wOut).sum()
+        }
+        let analytic = MLX.grad(loss)(pos0)
+        analytic.eval()
+        let analyticFlat = analytic.asArray(Float.self)
+
+        let eps: Float = 1e-3
+        let flat = pos0.asArray(Float.self)
+        var numeric = [Float](repeating: 0, count: flat.count)
+        for i in 0..<flat.count {
+            // z channel of pos doesn't affect screen projection at all → both
+            // analytic and FD should report 0. (We still test to confirm.)
+            var plus = flat; plus[i] += eps
+            var minus = flat; minus[i] -= eps
+            let lp = loss(MLXArray(plus, pos0.shape)).item(Float.self)
+            let lm = loss(MLXArray(minus, pos0.shape)).item(Float.self)
+            numeric[i] = (lp - lm) / (2 * eps)
+        }
+        for i in 0..<flat.count {
+            XCTAssertEqual(analyticFlat[i], numeric[i], accuracy: 5e-3,
+                           "pos elem \(i): analytic \(analyticFlat[i]) vs fd \(numeric[i])")
+        }
+    }
+
+    /// At least one pos element should receive a non-zero gradient — otherwise
+    /// the test fixture isn't actually exercising the silhouette path.
+    func testPosGradientIsNonTrivial() {
+        let N = 1, H = 4, W = 4, C = 1
+        let (pos0, tri) = quadFixture()
+        let (rast, _) = DiffRast.rasterize(pos0, tri: tri,
                                            resolution: (height: H, width: W),
                                            gradDB: false)
         let color = MLXArray((0..<(N * H * W * C)).map { Float($0) },
@@ -201,10 +262,8 @@ final class AntialiasTests: XCTestCase {
         let loss: (MLXArray) -> MLXArray = { p in
             DiffRast.antialias(color: color, rast: rast, pos: p, tri: tri).sum()
         }
-        let g = MLX.grad(loss)(pos)
-        for v in g.asArray(Float.self) {
-            XCTAssertEqual(v, 0, accuracy: 1e-7,
-                           "d_pos must stay zero until M4.3 (silhouette pos gradient)")
-        }
+        let g = MLX.grad(loss)(pos0).asArray(Float.self)
+        XCTAssertTrue(g.contains { abs($0) > 1e-5 },
+                      "Expected at least one pos element to receive a nonzero gradient; got all zeros")
     }
 }
