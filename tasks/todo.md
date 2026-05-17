@@ -91,9 +91,17 @@ meshes the inner loop becomes dominated by 4 float comparisons (the AABB
 reject) for the vast majority of triangles, since most triangles are far
 from any given pixel.
 
+#### M2.5 — Range mode (✅ DONE)
+- [x] `rasterize(..., ranges: [N, 2])` with shared `pos: [V, 4]` vertex buffer
+- [x] Default `ranges = [[0, T]] × N` synthesized for instanced mode — keeps
+      the kernel code path uniform across both layouts
+- [x] Range check folded into the precompute kernel (out-of-range triangles
+      get `area = 0`, the forward already skips those)
+- [x] Differentiable through MLX's broadcast-backward — gradient flows back to
+      the shared `[V, 4]` buffer correctly (summed over batches)
+
 #### Deferred
-- [ ] Range mode (`pos` shape `[V, 4]` + `ranges` tensor)
-- [ ] `DepthPeeler` analog for transparency
+- [ ] `DepthPeeler` analog for transparency / multi-layer rendering
 - [ ] True per-tile bin lists (one allocator pass + one rasterize pass) — the
       next step beyond AABB rejection when triangle counts go past ~10⁴ and
       the per-triangle screen reads start to dominate.
@@ -139,7 +147,8 @@ in the header must take what they need as explicit parameters.
 
 #### M4.1 — Topology + API stub (✅ DONE)
 - [x] `antialiasConstructTopologyHash(tri:)` — full Swift implementation,
-      returns `[T, 3]` int32 neighbor table (`-1` for boundary edges).
+      returns `[T, 3]` int32 neighbor table. `-1` = boundary, `-2` =
+      non-manifold (3+ triangles share that edge — silhouette skipped).
       O(T log T), pure CPU; cache alongside `tri`.
 - [x] `antialias(color:, rast:, pos:, tri:, topologyHash:)` API surface as a
       CustomFunction. **Forward is currently identity; d_color is identity;

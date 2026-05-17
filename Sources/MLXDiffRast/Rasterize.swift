@@ -4,74 +4,107 @@ import MLXFast
 
 extension DiffRast {
 
-    /// Rasterize a triangle mesh in clip space (M2.1 forward + M2.2 pixel derivatives).
+    /// Rasterize a triangle mesh in clip space.
     ///
-    /// This is a pure-compute software rasterizer: each pixel thread iterates over
-    /// every triangle and keeps the front-most one. Suitable for the moderate
-    /// triangle counts typical of inverse rendering (≲ few thousand triangles).
-    /// We can swap to a hardware `MTLRenderPipeline` backend later without changing
-    /// the public API.
+    /// Pure-compute software rasterizer: each pixel thread iterates over the
+    /// triangles relevant for its batch (with AABB rejection) and keeps the
+    /// front-most one. A per-(batch, triangle) precompute pass does the
+    /// perspective divide once.
+    ///
+    /// **Two input layouts** are supported:
+    ///   - **Instanced mode** (default): `pos: [N, V, 4]`, one vertex set per
+    ///     batch. `tri` is shared. `ranges` is ignored.
+    ///   - **Range mode**: `pos: [V, 4]` (single shared vertex set),
+    ///     `ranges: [N, 2]` int32 `(start_tri, count_tri)` selecting a
+    ///     subrange of `tri` per batch. The batch dimension `N` is taken
+    ///     from `ranges.shape[0]`.
     ///
     /// Conventions (match nvdiffrast):
-    ///   - `pos`:    `[N, V, 4]` in clip space — channels are `(x*w, y*w, z*w, w)`.
-    ///               Range mode (`[V, 4]` + `ranges`) is deferred.
-    ///   - `tri`:    `[T, 3]` int32 vertex indices.
+    ///   - clip-space `pos` channels are `(x*w, y*w, z*w, w)`
+    ///   - `tri`: `[T_total, 3]` int32 vertex indices.
     ///   - Output `rast`: `[N, H, W, 4]` with channels `(u, v, z/w, tri_id+1)`.
-    ///     - `u, v` are linear barycentrics (vertex 0 weight = `1-u-v`).
-    ///     - `tri_id+1 == 0` marks empty pixels.
-    ///   - Pixel `(h=0, w=0)` is top-left; NDC `+y` is up (vertical flip applied).
+    ///   - Pixel `(h=0, w=0)` is top-left; NDC `+y` is up (flipped on output).
     ///
-    /// `rastDB` (returned when `gradDB == true`, default) has shape `[N, H, W, 4]`
-    /// with channels `(du/dx, du/dy, dv/dx, dv/dy)` in per-pixel units. Empty
-    /// `[N, H, W, 0]` tensor when disabled. Feeds the `diffAttrs` branch of
-    /// `interpolate` and the mipmap-LOD selection in `texture`.
+    /// `rastDB` (when `gradDB == true`) has shape `[N, H, W, 4]` with channels
+    /// `(du/dx, du/dy, dv/dx, dv/dy)` in per-pixel units. Empty
+    /// `[N, H, W, 0]` tensor when disabled.
     ///
-    /// **Differentiability (M2.1 limitation):** the VJP currently returns zeros.
-    /// Calling `grad` w.r.t. `pos` will silently get zero gradients until M2.3
-    /// implements the analytic backward.
+    /// Differentiable w.r.t. `pos` in both modes. In range mode the gradient
+    /// flows back through MLX's automatic broadcast-backward to the shared
+    /// `[V, 4]` vertex buffer (summed across batches).
     @discardableResult
     public static func rasterize(
         _ pos: MLXArray,
         tri: MLXArray,
         resolution: (height: Int, width: Int),
-        gradDB: Bool = true
+        gradDB: Bool = true,
+        ranges: MLXArray? = nil
     ) -> (rast: MLXArray, rastDB: MLXArray) {
-        precondition(pos.ndim == 3 && pos.shape[2] == 4,
-                     "rasterize: pos must be [N, V, 4] (got \(pos.shape))")
         precondition(tri.ndim == 2 && tri.shape[1] == 3,
                      "rasterize: tri must be [T, 3] (got \(tri.shape))")
-
-        let N = pos.shape[0], V = pos.shape[1]
-        let H = resolution.height, W = resolution.width
-        let T = tri.shape[0]
         let triI32 = tri.dtype == .int32 ? tri : tri.asType(.int32)
+        let T = tri.shape[0]
+        let H = resolution.height, W = resolution.width
+
+        // Normalize the input layout. After this branch, `posInstanced` is
+        // `[N, V, 4]` (possibly via broadcast of a shared vertex buffer) and
+        // `rangesArr` is `[N, 2]` int32 (start_tri, count_tri).
+        let posInstanced: MLXArray
+        let rangesArr: MLXArray
+        let N: Int
+        let V: Int
+        if let userRanges = ranges {
+            precondition(pos.ndim == 2 && pos.shape[1] == 4,
+                         "rasterize: with `ranges`, pos must be [V, 4] (got \(pos.shape))")
+            precondition(userRanges.ndim == 2 && userRanges.shape[1] == 2,
+                         "rasterize: ranges must be [N, 2] (got \(userRanges.shape))")
+            N = userRanges.shape[0]
+            V = pos.shape[0]
+            // Differentiable broadcast: MLX backprops the sum across the
+            // synthetic N dim, so the gradient lands on the shared [V, 4]
+            // vertex buffer correctly.
+            let expanded = pos.expandedDimensions(axis: 0)
+            posInstanced = (N > 1) ? broadcast(expanded, to: [N, V, 4]) : expanded
+            rangesArr = userRanges.dtype == .int32 ? userRanges : userRanges.asType(.int32)
+        } else {
+            precondition(pos.ndim == 3 && pos.shape[2] == 4,
+                         "rasterize: pos must be [N, V, 4] (got \(pos.shape))")
+            N = pos.shape[0]
+            V = pos.shape[1]
+            posInstanced = pos
+            // Default: every batch uses all triangles.
+            var defaultRanges: [Int32] = []
+            for _ in 0..<N { defaultRanges += [0, Int32(T)] }
+            rangesArr = MLXArray(defaultRanges, [N, 2])
+        }
 
         if !gradDB {
             let fwd: ([MLXArray]) -> [MLXArray] = { inputs in
-                [Self.rasterizeForwardKernel(pos: inputs[0], tri: triI32,
+                [Self.rasterizeForwardKernel(pos: inputs[0], tri: triI32, ranges: rangesArr,
                                              N: N, V: V, T: T, H: H, W: W)]
             }
             let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
                 let dPos = Self.rasterizeBackwardKernel(
                     pos: primals[0], tri: triI32,
-                    rast: forwardRastForBwd(primals[0], triI32, N, V, T, H, W),
+                    rast: forwardRastForBwd(primals[0], triI32, rangesArr, N, V, T, H, W),
                     dRast: cotangents[0],
                     dRastDB: MLXArray.zeros([N, H, W, 4], dtype: .float32),
                     N: N, V: V, H: H, W: W)
                 return [dPos]
             }
             let custom = CustomFunction { Forward(fwd); VJP(vjp) }
-            let rast = custom([pos])[0]
+            let rast = custom([posInstanced])[0]
             return (rast, MLXArray.zeros([N, H, W, 0]))
         } else {
             let fwd: ([MLXArray]) -> [MLXArray] = { inputs in
-                let (r, db) = Self.rasterizeForwardDBKernel(pos: inputs[0], tri: triI32,
+                let (r, db) = Self.rasterizeForwardDBKernel(pos: inputs[0], tri: triI32, ranges: rangesArr,
                                                            N: N, V: V, T: T, H: H, W: W)
                 return [r, db]
             }
             let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
                 let (r, _) = Self.rasterizeForwardDBKernel(
-                    pos: primals[0], tri: triI32, N: N, V: V, T: T, H: H, W: W)
+                    pos: primals[0], tri: triI32, ranges: rangesArr,
+                    N: N, V: V, T: T, H: H, W: W)
                 let dPos = Self.rasterizeBackwardKernel(
                     pos: primals[0], tri: triI32, rast: r,
                     dRast: cotangents[0], dRastDB: cotangents[1],
@@ -79,7 +112,7 @@ extension DiffRast {
                 return [dPos]
             }
             let custom = CustomFunction { Forward(fwd); VJP(vjp) }
-            let outs = custom([pos])
+            let outs = custom([posInstanced])
             return (outs[0], outs[1])
         }
     }
@@ -88,10 +121,10 @@ extension DiffRast {
     /// winning triangle per pixel). MLX doesn't cache the primal outputs, so we
     /// recompute. Cheap relative to the backward itself.
     private static func forwardRastForBwd(
-        _ pos: MLXArray, _ tri: MLXArray,
+        _ pos: MLXArray, _ tri: MLXArray, _ ranges: MLXArray,
         _ N: Int, _ V: Int, _ T: Int, _ H: Int, _ W: Int
     ) -> MLXArray {
-        rasterizeForwardKernel(pos: pos, tri: tri, N: N, V: V, T: T, H: H, W: W)
+        rasterizeForwardKernel(pos: pos, tri: tri, ranges: ranges, N: N, V: V, T: T, H: H, W: W)
     }
 
     // MARK: - Precompute (per-triangle screen-space data)
@@ -112,13 +145,21 @@ extension DiffRast {
 
         uint tri_idx = idx % (uint)T;
         uint pn = idx / (uint)T;
+        uint out_base = (pn * (uint)T + tri_idx) * 10u;
+
+        // Range-mode check: skip triangles outside this batch's range.
+        int range_start = ranges[pn * 2 + 0];
+        int range_count = ranges[pn * 2 + 1];
+        if ((int)tri_idx < range_start || (int)tri_idx >= range_start + range_count) {
+            for (int k = 0; k < 10; ++k) out[out_base + (uint)k] = 0.0f;
+            return;
+        }
 
         int i0 = tri[tri_idx * 3 + 0];
         int i1 = tri[tri_idx * 3 + 1];
         int i2 = tri[tri_idx * 3 + 2];
 
         uint pos_n_base = pn * (uint)V * 4u;
-        uint out_base = (pn * (uint)T + tri_idx) * 10u;
 
         float w0 = pos[pos_n_base + (uint)i0 * 4u + 3];
         float w1 = pos[pos_n_base + (uint)i1 * 4u + 3];
@@ -149,17 +190,17 @@ extension DiffRast {
 
     private static let precomputeKernel = MLXFast.metalKernel(
         name: "diffrast_rasterize_precompute",
-        inputNames: ["pos", "tri"], outputNames: ["out"],
+        inputNames: ["pos", "tri", "ranges"], outputNames: ["out"],
         source: precomputeSource)
 
     private static func rasterizePrecompute(
-        pos: MLXArray, tri: MLXArray,
+        pos: MLXArray, tri: MLXArray, ranges: MLXArray,
         N: Int, V: Int, T: Int
     ) -> MLXArray {
         let total = N * T
         let rounded = ((total + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         return precomputeKernel(
-            [pos, tri],
+            [pos, tri, ranges],
             template: [("N", N), ("V", V), ("T", T)],
             grid: (rounded, 1, 1),
             threadGroup: (rasterizeTG, 1, 1),
@@ -594,10 +635,11 @@ extension DiffRast {
     private static let rasterizeTG = 256
 
     private static func rasterizeForwardKernel(
-        pos: MLXArray, tri: MLXArray,
+        pos: MLXArray, tri: MLXArray, ranges: MLXArray,
         N: Int, V: Int, T: Int, H: Int, W: Int
     ) -> MLXArray {
-        let screen = rasterizePrecompute(pos: pos, tri: tri, N: N, V: V, T: T)
+        let screen = rasterizePrecompute(pos: pos, tri: tri, ranges: ranges,
+                                         N: N, V: V, T: T)
         let pixels = N * H * W
         let rounded = ((pixels + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         return fwdKernel(
@@ -629,10 +671,11 @@ extension DiffRast {
     }
 
     private static func rasterizeForwardDBKernel(
-        pos: MLXArray, tri: MLXArray,
+        pos: MLXArray, tri: MLXArray, ranges: MLXArray,
         N: Int, V: Int, T: Int, H: Int, W: Int
     ) -> (MLXArray, MLXArray) {
-        let screen = rasterizePrecompute(pos: pos, tri: tri, N: N, V: V, T: T)
+        let screen = rasterizePrecompute(pos: pos, tri: tri, ranges: ranges,
+                                         N: N, V: V, T: T)
         let pixels = N * H * W
         let rounded = ((pixels + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         let outs = fwdDBKernel(

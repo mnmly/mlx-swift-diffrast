@@ -245,6 +245,60 @@ final class RasterizeTests: XCTestCase {
         }
     }
 
+    // MARK: - Range mode
+
+    /// Two triangles in the same `tri` buffer, different batches each render
+    /// a different subrange. Verifies range-mode picks the right triangles.
+    func testRangeModeSelectsPerBatchTriangles() {
+        // Shared vertex buffer with 6 vertices arranged as two non-overlapping
+        // triangles. tri lists triangle 0 (vertices 0-2) and triangle 1
+        // (vertices 3-5). Batch 0 sees only triangle 0; batch 1 only triangle 1.
+        let pos = MLXArray([
+            // triangle 0: upper-left filled
+            Float(-1.0),  1.0, 0, 1,
+            Float(-1.0), -1.0, 0, 1,
+            Float( 1.0),  1.0, 0, 1,
+            // triangle 1: lower-right filled
+            Float( 1.0),  1.0, 0.5, 1,
+            Float(-1.0), -1.0, 0.5, 1,
+            Float( 1.0), -1.0, 0.5, 1,
+        ], [6, 4])
+        let tri = MLXArray([
+            Int32(0), 1, 2,
+            Int32(3), 4, 5,
+        ], [2, 3])
+        let ranges = MLXArray([
+            Int32(0), 1,    // batch 0: triangles [0, 1) → just tri 0
+            Int32(1), 1,    // batch 1: triangles [1, 2) → just tri 1
+        ], [2, 2])
+
+        let (rast, _) = DiffRast.rasterize(
+            pos, tri: tri, resolution: (height: 2, width: 2), gradDB: false, ranges: ranges)
+        XCTAssertEqual(rast.shape, [2, 2, 2, 4])
+
+        let flat = rast.asArray(Float.self)
+        // Batch 0: only tri 0 (z=0) is visible → tri_id+1 must be 1 where covered.
+        // Batch 1: only tri 1 (z=0.5) is visible → tri_id+1 must be 2 where covered.
+        for h in 0..<2 {
+            for w in 0..<2 {
+                let i0 = ((0 * 2 + h) * 2 + w) * 4 + 3
+                let i1 = ((1 * 2 + h) * 2 + w) * 4 + 3
+                let id0 = flat[i0]
+                let id1 = flat[i1]
+                XCTAssertTrue(id0 == 0 || id0 == 1,
+                              "batch 0 (h=\(h),w=\(w)) tri_id+1 = \(id0); only tri 0 allowed")
+                XCTAssertTrue(id1 == 0 || id1 == 2,
+                              "batch 1 (h=\(h),w=\(w)) tri_id+1 = \(id1); only tri 1 allowed")
+            }
+        }
+        // At least one pixel in each batch should be covered by its assigned
+        // triangle (otherwise the ranges aren't doing anything visible).
+        let anyB0 = (0..<4).contains { flat[(0 * 4 + $0) * 4 + 3] == 1 }
+        let anyB1 = (0..<4).contains { flat[(1 * 4 + $0) * 4 + 3] == 2 }
+        XCTAssertTrue(anyB0, "batch 0 should have at least one pixel covered by tri 0")
+        XCTAssertTrue(anyB1, "batch 1 should have at least one pixel covered by tri 1")
+    }
+
     /// Sanity: feeding the rast output into `interpolate` produces non-zero attrs
     /// on covered pixels. This is the first end-to-end check across the two ops.
     func testRasterizeIntoInterpolate() {

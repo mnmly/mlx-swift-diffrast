@@ -41,6 +41,35 @@ final class AntialiasTests: XCTestCase {
         XCTAssertEqual(hash.asArray(Int32.self), [-1, -1, -1])
     }
 
+    /// Edge shared by 3+ triangles is non-manifold. The topology builder
+    /// should mark each instance with `-2` so the silhouette algorithm skips
+    /// it (it can't unambiguously identify a single "neighbor").
+    func testTopologyHashNonManifoldEdgeMarked() {
+        // Three triangles all sharing the edge (v0, v1). Vertices v2, v3, v4
+        // each pair with the shared edge to form a tri.
+        //   Tri 0: (0, 1, 2)
+        //   Tri 1: (0, 1, 3)
+        //   Tri 2: (0, 1, 4)
+        // Edge (0, 1) is the k=2 edge of each (edge opposite vertex 2 = (v0, v1)).
+        let tri = MLXArray([
+            Int32(0), 1, 2,
+            Int32(0), 1, 3,
+            Int32(0), 1, 4,
+        ], [3, 3])
+        let hash = DiffRast.antialiasConstructTopologyHash(tri).asArray(Int32.self)
+        // All three tris' k=2 edge should be marked as non-manifold (-2).
+        XCTAssertEqual(hash[0 * 3 + 2], -2, "tri 0 k=2 non-manifold")
+        XCTAssertEqual(hash[1 * 3 + 2], -2, "tri 1 k=2 non-manifold")
+        XCTAssertEqual(hash[2 * 3 + 2], -2, "tri 2 k=2 non-manifold")
+        // The other 6 edges are pairwise boundary or shared. Edges (1, 2)
+        // and (2, 0) of tri 0 are boundary, similarly for tris 1/2. No two
+        // of these match, so they all stay -1.
+        for t in 0..<3 {
+            XCTAssertEqual(hash[t * 3 + 0], -1, "tri \(t) k=0 should be boundary")
+            XCTAssertEqual(hash[t * 3 + 1], -1, "tri \(t) k=1 should be boundary")
+        }
+    }
+
     // MARK: - Antialias stub
 
     // MARK: - M4.2 silhouette blend

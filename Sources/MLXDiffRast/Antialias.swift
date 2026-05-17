@@ -6,13 +6,16 @@ extension DiffRast {
 
     /// Build the triangle-edge adjacency table consumed by `antialias`.
     ///
-    /// Returns an `[T, 3]` int32 tensor where entry `[t, k]` is the index of
-    /// the triangle that shares the edge *opposite vertex k* of triangle `t`
-    /// (i.e. the edge connecting vertices `tri[t, (k+1)%3]` and
-    /// `tri[t, (k+2)%3]`). `-1` marks a boundary edge with no neighbor.
+    /// Returns an `[T, 3]` int32 tensor where entry `[t, k]` is one of:
+    ///   - `-1` — boundary edge (no other triangle uses it)
+    ///   - `-2` — non-manifold edge (3+ triangles share it); the silhouette
+    ///     algorithm skips these, since the silhouette side isn't
+    ///     unambiguously defined
+    ///   - `>= 0` — the index of the *single* other triangle sharing this edge
+    ///     (manifold)
     ///
-    /// This is pure Swift / CPU work and is cheap to call once per topology
-    /// change; you typically cache the result alongside `tri`.
+    /// Pure Swift / CPU work and cheap to call once per topology change; you
+    /// typically cache the result alongside `tri`.
     public static func antialiasConstructTopologyHash(_ tri: MLXArray) -> MLXArray {
         precondition(tri.ndim == 2 && tri.shape[1] == 3,
                      "antialiasConstructTopologyHash: tri must be [T, 3] (got \(tri.shape))")
@@ -44,11 +47,19 @@ extension DiffRast {
             let e = edges[i]
             var j = i + 1
             while j < edges.count && edges[j].a == e.a && edges[j].b == e.b { j += 1 }
-            if j - i == 2 {
+            let runLen = j - i
+            if runLen == 2 {
                 let e0 = edges[i], e1 = edges[i + 1]
                 neighbor[e0.t * 3 + e0.k] = Int32(e1.t)
                 neighbor[e1.t * 3 + e1.k] = Int32(e0.t)
+            } else if runLen > 2 {
+                // Non-manifold: 3+ triangles share this edge. Mark all of them
+                // with -2 so the silhouette-edge selector never picks them.
+                for k in i..<j {
+                    neighbor[edges[k].t * 3 + edges[k].k] = -2
+                }
             }
+            // runLen == 1 → boundary, already -1.
             i = j
         }
         return MLXArray(neighbor, [T, 3])
