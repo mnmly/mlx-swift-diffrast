@@ -81,13 +81,38 @@ from every pixel center.
 - [ ] Replace per-pixel ∀-triangle loop with a tile-based hierarchical pass
       when triangle counts grow beyond a few thousand
 
-### M3 — `texture` (✅ M3.1 DONE — bilinear; mipmap and cube deferred)
+### M3 — `texture`
+
+#### M3.1 — Bilinear (✅ DONE)
 - [x] Bilinear forward with three boundary modes (wrap, clamp, zero)
 - [x] VJP for `tex` (atomic scatter-add) and `uv` (per-pixel analytic)
 - [x] 4 gradchecks across boundary modes + 5 forward correctness tests
-- [ ] `texture_construct_mip` + mipmap-linear / linear-mipmap-linear filters
-- [ ] `uv_da` / `mip_level_bias`-driven LOD selection
-- [ ] Cube textures + `cube` boundary mode
+
+#### M3.2 — Mipmap + trilinear + LOD selection (✅ DONE)
+- [x] `textureConstructMip(tex, maxLevel:)` — pure MLX-ops pyramid build, so
+      gradient through downsampling is auto-differentiated. Stops at first
+      odd dim or `maxLevel`.
+- [x] `FilterMode.linearMipmapLinear` (trilinear) — per-pixel LOD from
+      `uvDA` via `ρ² = max(|ds/dx|² + |dt/dx|², |ds/dy|² + |dt/dy|²)`,
+      `lod = 0.5 · log₂(ρ²)`, clamped to `[0, NUM_LEVELS - 1]`. Bilinear
+      samples at floor and ceil mip levels, linearly blended by `frac(lod)`.
+- [x] Pyramid packed into one flat tensor + (offsets, H, W) metadata so the
+      kernel can index any level with arithmetic — `d_packed_pyramid` then
+      auto-flows back through `concatenate`/`reshape`/`mean` to `d_tex`.
+- [x] `d_uv` gradcheck (multi-level sum chain) and `d_tex` gradcheck pass
+      against MLX `grad` + finite differences.
+
+#### Deferred
+- [ ] `d_uvDA` (gradient through the LOD chain rule) — currently zero.
+      Connects texture loss back to `pos` through `rast_db` for full
+      texture-aware geometry optimization.
+- [ ] `mip_level_bias` per-pixel bias parameter.
+- [ ] `filter_mode = .nearest`, `.linearMipmapNearest`, `.nearestMipmapLinear`.
+- [ ] Cube textures + `cube` boundary mode.
+
+Metal-kernel note: template args (e.g. `BOUNDARY`) are NOT visible inside the
+`header:` block — they only resolve in the main kernel body. Helper functions
+in the header must take what they need as explicit parameters.
 
 Metal-kernel note: template args (e.g. `BOUNDARY`) are NOT visible inside the
 `header:` block — they only resolve in the main kernel body. Helper functions
