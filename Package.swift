@@ -59,6 +59,9 @@ let package = Package(
                 "MLXDiffRast",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            resources: [
+                .copy("Fixtures/diffrast_fixtures.safetensors"),
             ]
         ),
     ]
