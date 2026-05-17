@@ -31,7 +31,9 @@ Port NVIDIA nvdiffrast to MLX Swift / Metal, preserving the public API shape of
 - [x] Batch broadcast (`attr.shape[0] == 1`)
 - [x] `rast_db` / `diff_attrs = .all` pixel-derivative branch
 - [x] Finite-difference gradcheck for attr/rast/rastDB on both basic and DA paths
-- [ ] (deferred) `diff_attrs = .indices([Int])` subset selection — only `.all` supported today
+- [x] `diff_attrs = .indices([Int])` subset selection — DA kernels now take a
+      `diff_idx` int array and `K` template arg; `.all` is the case K=A with
+      identity indices.
 - [ ] (deferred) Validate against PyTorch nvdiffrast on a real triangle mesh fixture
       — gradcheck covers internal correctness; deferring until M2 lands so we can
       compare end-to-end (rasterize → interpolate) against the reference.

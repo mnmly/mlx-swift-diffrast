@@ -98,6 +98,100 @@ final class InterpolateTests: XCTestCase {
         }
     }
 
+    // MARK: - diff_attrs subset
+
+    /// `diffAttrs: .indices(...)` should produce an `outDA` of shape
+    /// `[N, H, W, 2·K]` where K is the index count, with values matching the
+    /// corresponding channels from `.all`.
+    func testDiffAttrsIndicesMatchesAllSubset() {
+        let N = 1, H = 1, W = 1, A = 3, V = 3
+        let attr = MLXArray([
+            Float(1), 2, 3,
+            Float(4), 5, 6,
+            Float(7), 8, 9,
+        ], [N, V, A])
+        let tri = MLXArray([Int32(0), 1, 2], [1, 3])
+        let rast = MLXArray([Float(0.2), 0.3, 0.0, 1.0], [N, H, W, 4])
+        let rastDB = MLXArray([Float(0.5), 0.1, -0.2, 0.3], [N, H, W, 4])
+
+        let (_, daAll) = DiffRast.interpolate(
+            attr, rast: rast, tri: tri, rastDB: rastDB, diffAttrs: .all)
+        let (_, daIdx) = DiffRast.interpolate(
+            attr, rast: rast, tri: tri, rastDB: rastDB,
+            diffAttrs: .indices([0, 2]))
+        XCTAssertEqual(daAll.shape, [N, H, W, 2 * A])
+        XCTAssertEqual(daIdx.shape, [N, H, W, 4])  // 2*K, K=2
+
+        let all = daAll.asArray(Float.self)
+        let idx = daIdx.asArray(Float.self)
+        XCTAssertEqual(idx[0], all[0], accuracy: 1e-6, "attr 0 du")
+        XCTAssertEqual(idx[1], all[1], accuracy: 1e-6, "attr 0 dv")
+        XCTAssertEqual(idx[2], all[4], accuracy: 1e-6, "attr 2 du (from .all index 4)")
+        XCTAssertEqual(idx[3], all[5], accuracy: 1e-6, "attr 2 dv (from .all index 5)")
+    }
+
+    func testDiffAttrsIndicesGradcheckAttr() throws {
+        try runDiffAttrsIndicesGradcheck(perturb: .attr)
+    }
+
+    func testDiffAttrsIndicesGradcheckRastDB() throws {
+        try runDiffAttrsIndicesGradcheck(perturb: .rastDB)
+    }
+
+    private func runDiffAttrsIndicesGradcheck(perturb: PerturbTarget) throws {
+        let N = 1, H = 2, W = 2, A = 4, V = 3
+
+        MLXRandom.seed(0x1D7E50A2)
+
+        var us: [Float] = [], vs: [Float] = []
+        let uniform: () -> Float = { Float.random(in: 0.05...0.45, using: &Self.rng) }
+        for _ in 0..<(H * W) { us.append(uniform()); vs.append(uniform()) }
+        var rastVals: [Float] = []
+        for i in 0..<(H * W) { rastVals += [us[i], vs[i], 0.0, 1.0] }
+        let attr = MLXRandom.normal([N, V, A])
+        let rast = MLXArray(rastVals, [N, H, W, 4])
+        let rastDB = MLXRandom.normal([N, H, W, 4])
+        let tri = MLXArray([Int32(0), 1, 2], [1, 3])
+
+        let indices: [Int32] = [1, 3]
+        let K = indices.count
+        let wOut  = MLXRandom.normal([N, H, W, A])
+        let wOutDA = MLXRandom.normal([N, H, W, 2 * K])
+
+        let loss: (MLXArray) -> MLXArray = { x in
+            let (o, oda): (MLXArray, MLXArray)
+            switch perturb {
+            case .attr:
+                (o, oda) = DiffRast.interpolate(
+                    x, rast: rast, tri: tri, rastDB: rastDB,
+                    diffAttrs: .indices(indices))
+            case .rast: fatalError("not used here")
+            case .rastDB:
+                (o, oda) = DiffRast.interpolate(
+                    attr, rast: rast, tri: tri, rastDB: x,
+                    diffAttrs: .indices(indices))
+            }
+            return (o * wOut).sum() + (oda * wOutDA).sum()
+        }
+        let input: MLXArray = (perturb == .attr) ? attr : rastDB
+
+        let analytic = MLX.grad(loss)(input)
+        analytic.eval()
+        let analyticFlat = analytic.asArray(Float.self)
+
+        let eps: Float = 1e-3
+        let flat = input.asArray(Float.self)
+        for i in 0..<flat.count {
+            var plus = flat; plus[i] += eps
+            var minus = flat; minus[i] -= eps
+            let lp = loss(MLXArray(plus, input.shape)).item(Float.self)
+            let lm = loss(MLXArray(minus, input.shape)).item(Float.self)
+            let fd = (lp - lm) / (2 * eps)
+            XCTAssertEqual(analyticFlat[i], fd, accuracy: 5e-3,
+                           "[\(perturb) .indices] elem \(i): \(analyticFlat[i]) vs \(fd)")
+        }
+    }
+
     // MARK: - Gradcheck
 
     /// Finite-difference check of d_out/d_attr against MLX's autograd.

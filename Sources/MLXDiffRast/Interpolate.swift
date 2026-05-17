@@ -4,11 +4,17 @@ import MLXFast
 
 extension DiffRast {
 
-    /// Pixel-derivative selector for `interpolate`. Currently only `.all` is supported
-    /// (matches nvdiffrast `diff_attrs='all'`). A future revision will support
-    /// `.indices([Int])` for selecting a subset of attributes.
+    /// Pixel-derivative selector for `interpolate`.
+    ///
+    /// - `.all`: compute pixel derivatives for every attribute channel —
+    ///   `outDA` shape is `[N, H, W, 2·A]`.
+    /// - `.indices(_)`: compute derivatives only for the listed attribute
+    ///   channels. `outDA` shape is `[N, H, W, 2·K]` where K is the index
+    ///   count. Useful when only a subset of a wide attribute buffer needs
+    ///   its pixel-space derivatives (saves memory + backward work).
     public enum DiffAttrs: Equatable {
         case all
+        case indices([Int32])
     }
 
     // MARK: - Public API
@@ -28,8 +34,9 @@ extension DiffRast {
     ///
     /// Returns `(out, outDA)`:
     ///   - `out`:   `[N, H, W, A]` interpolated attributes (zero on empty pixels).
-    ///   - `outDA`: `[N, H, W, 2*A]` per-pixel `(dA/dx, dA/dy)` pairs when `diffAttrs == .all`;
-    ///              empty tensor `[N, H, W, 0]` otherwise.
+    ///   - `outDA`: `[N, H, W, 2·K]` per-pixel `(dA/dx, dA/dy)` pairs when
+    ///              `diffAttrs` is set (K = A for `.all`, K = `indices.count`
+    ///              for `.indices`); empty tensor `[N, H, W, 0]` otherwise.
     ///
     /// Differentiable w.r.t. `attr`, `rast`, and `rastDB`. `tri` is treated as constant.
     @discardableResult
@@ -87,18 +94,35 @@ extension DiffRast {
             let emptyDA = MLXArray.zeros([N, H, W, 0])
             return (out, emptyDA)
         } else {
+            // Resolve the index list. `.all` expands to [0, 1, ..., A-1].
+            let indices: [Int32]
+            switch diffAttrs! {
+            case .all:
+                indices = (0..<Int32(A)).map { $0 }
+            case .indices(let idx):
+                precondition(!idx.isEmpty,
+                             "interpolate: diffAttrs.indices must be non-empty")
+                precondition(idx.allSatisfy { $0 >= 0 && Int($0) < A },
+                             "interpolate: diffAttrs.indices values must be in [0, A) (A=\(A))")
+                indices = idx
+            }
+            let K = indices.count
+            let diffIdx = MLXArray(indices, [K])
+
             // DA path: two outputs, three differentiable primals.
             let fwd: ([MLXArray]) -> [MLXArray] = { inputs in
                 let (o, oda) = Self.fwdDA(
-                    attr: inputs[0], rast: inputs[1], rastDB: inputs[2], tri: triCaptured,
-                    N: N, H: H, W: W, A: A)
+                    attr: inputs[0], rast: inputs[1], rastDB: inputs[2],
+                    tri: triCaptured, diffIdx: diffIdx,
+                    N: N, H: H, W: W, A: A, K: K)
                 return [o, oda]
             }
             let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
                 let (dAttr, dRast, dRastDB) = Self.bwdDA(
-                    attr: primals[0], rast: primals[1], rastDB: primals[2], tri: triCaptured,
+                    attr: primals[0], rast: primals[1], rastDB: primals[2],
+                    tri: triCaptured, diffIdx: diffIdx,
                     dOut: cotangents[0], dOutDA: cotangents[1],
-                    N: N, H: H, W: W, A: A)
+                    N: N, H: H, W: W, A: A, K: K)
                 return [dAttr, dRast, dRastDB]
             }
             let custom = CustomFunction { Forward(fwd); VJP(vjp) }
@@ -145,9 +169,9 @@ extension DiffRast {
         }
     """
 
-    /// Forward (DA). Writes both `out` and `out_da`.
-    /// `out_da[..., 2a]   = (a1-a0)*du/dx + (a2-a0)*dv/dx`
-    /// `out_da[..., 2a+1] = (a1-a0)*du/dy + (a2-a0)*dv/dy`
+    /// Forward (DA). Writes both `out` (over all A) and `out_da` (over K
+    /// selected attribute indices). For `K = A` with identity index list this
+    /// reduces to the `.all` case.
     private static let fwdDASource = """
         uint pix = thread_position_in_grid.x;
         uint total = (uint)N * (uint)H * (uint)W;
@@ -164,11 +188,11 @@ extension DiffRast {
         int   t  = (int)ti - 1;
 
         uint out_base  = ((n * (uint)H + h) * (uint)W + w) * (uint)A;
-        uint outda_base = ((n * (uint)H + h) * (uint)W + w) * (uint)(2 * A);
+        uint outda_base = ((n * (uint)H + h) * (uint)W + w) * (uint)(2 * K);
 
         if (t < 0) {
             for (int a = 0; a < A; ++a) out[out_base + (uint)a] = 0.0f;
-            for (int k = 0; k < 2 * A; ++k) out_da[outda_base + (uint)k] = 0.0f;
+            for (int k = 0; k < 2 * K; ++k) out_da[outda_base + (uint)k] = 0.0f;
             return;
         }
 
@@ -178,21 +202,28 @@ extension DiffRast {
         float bw = 1.0f - u - v;
         uint attr_n_base = n * (uint)V * (uint)A;
 
-        float udx = rast_db[rast_base + 0];
-        float udy = rast_db[rast_base + 1];
-        float vdx = rast_db[rast_base + 2];
-        float vdy = rast_db[rast_base + 3];
-
+        // out: interpolated value for every attribute.
         for (int a = 0; a < A; ++a) {
             float a0 = attr[attr_n_base + (uint)i0 * (uint)A + (uint)a];
             float a1 = attr[attr_n_base + (uint)i1 * (uint)A + (uint)a];
             float a2 = attr[attr_n_base + (uint)i2 * (uint)A + (uint)a];
             out[out_base + (uint)a] = bw * a0 + u * a1 + v * a2;
+        }
 
+        // out_da: pixel derivatives for each of the K selected attributes.
+        float udx = rast_db[rast_base + 0];
+        float udy = rast_db[rast_base + 1];
+        float vdx = rast_db[rast_base + 2];
+        float vdy = rast_db[rast_base + 3];
+        for (int k = 0; k < K; ++k) {
+            int a = diff_idx[k];
+            float a0 = attr[attr_n_base + (uint)i0 * (uint)A + (uint)a];
+            float a1 = attr[attr_n_base + (uint)i1 * (uint)A + (uint)a];
+            float a2 = attr[attr_n_base + (uint)i2 * (uint)A + (uint)a];
             float d01 = a1 - a0;
             float d02 = a2 - a0;
-            out_da[outda_base + (uint)(2 * a + 0)] = d01 * udx + d02 * vdx;
-            out_da[outda_base + (uint)(2 * a + 1)] = d01 * udy + d02 * vdy;
+            out_da[outda_base + (uint)(2 * k + 0)] = d01 * udx + d02 * vdx;
+            out_da[outda_base + (uint)(2 * k + 1)] = d01 * udy + d02 * vdy;
         }
     """
 
@@ -232,12 +263,9 @@ extension DiffRast {
         }
     """
 
-    /// d_attr (DA). Atomic scatter-add from d_out AND d_out_da.
-    /// Contribution from d_out_da: for each attribute a, with cotangents
-    ///   gx = d_out_da[..., 2a], gy = d_out_da[..., 2a+1]:
-    ///   d/d_a0 += -(gx*udx + gy*udy + gx*vdx + gy*vdy)
-    ///   d/d_a1 += gx*udx + gy*udy
-    ///   d/d_a2 += gx*vdx + gy*vdy
+    /// d_attr (DA). Atomic scatter-add: contribution from `d_out` is over all
+    /// A attributes; contribution from `d_out_da` only fires for the K
+    /// selected attribute indices.
     private static let gradAttrDASource = """
         uint pix = thread_position_in_grid.x;
         uint total = (uint)N * (uint)H * (uint)W;
@@ -259,33 +287,39 @@ extension DiffRast {
         int i2 = tri[t * 3 + 2];
         float bw = 1.0f - u - v;
 
+        uint dout_base   = ((n * (uint)H + h) * (uint)W + w) * (uint)A;
+        uint doutda_base = ((n * (uint)H + h) * (uint)W + w) * (uint)(2 * K);
+        uint d_attr_n_base = n * (uint)V * (uint)A;
+
+        // Contribution from d_out: applies to every attribute.
+        for (int a = 0; a < A; ++a) {
+            float g = d_out[dout_base + (uint)a];
+            atomic_fetch_add_explicit(&d_attr[d_attr_n_base + (uint)i0 * (uint)A + (uint)a],
+                                      bw * g, memory_order_relaxed);
+            atomic_fetch_add_explicit(&d_attr[d_attr_n_base + (uint)i1 * (uint)A + (uint)a],
+                                      u  * g, memory_order_relaxed);
+            atomic_fetch_add_explicit(&d_attr[d_attr_n_base + (uint)i2 * (uint)A + (uint)a],
+                                      v  * g, memory_order_relaxed);
+        }
+
+        // Contribution from d_out_da: only for the K selected attributes.
         float udx = rast_db[rast_base + 0];
         float udy = rast_db[rast_base + 1];
         float vdx = rast_db[rast_base + 2];
         float vdy = rast_db[rast_base + 3];
-
-        uint dout_base   = ((n * (uint)H + h) * (uint)W + w) * (uint)A;
-        uint doutda_base = ((n * (uint)H + h) * (uint)W + w) * (uint)(2 * A);
-        uint d_attr_n_base = n * (uint)V * (uint)A;
-
-        for (int a = 0; a < A; ++a) {
-            float g  = d_out[dout_base + (uint)a];
-            float gx = d_out_da[doutda_base + (uint)(2 * a + 0)];
-            float gy = d_out_da[doutda_base + (uint)(2 * a + 1)];
-
+        for (int k = 0; k < K; ++k) {
+            int a = diff_idx[k];
+            float gx = d_out_da[doutda_base + (uint)(2 * k + 0)];
+            float gy = d_out_da[doutda_base + (uint)(2 * k + 1)];
             float u_term = gx * udx + gy * udy;
             float v_term = gx * vdx + gy * vdy;
 
-            float g0 = bw * g - u_term - v_term;
-            float g1 = u  * g + u_term;
-            float g2 = v  * g + v_term;
-
             atomic_fetch_add_explicit(&d_attr[d_attr_n_base + (uint)i0 * (uint)A + (uint)a],
-                                      g0, memory_order_relaxed);
+                                      -u_term - v_term, memory_order_relaxed);
             atomic_fetch_add_explicit(&d_attr[d_attr_n_base + (uint)i1 * (uint)A + (uint)a],
-                                      g1, memory_order_relaxed);
+                                      u_term, memory_order_relaxed);
             atomic_fetch_add_explicit(&d_attr[d_attr_n_base + (uint)i2 * (uint)A + (uint)a],
-                                      g2, memory_order_relaxed);
+                                      v_term, memory_order_relaxed);
         }
     """
 
@@ -358,18 +392,19 @@ extension DiffRast {
         int i1 = tri[t * 3 + 1];
         int i2 = tri[t * 3 + 2];
 
-        uint doutda_base = ((n * (uint)H + h) * (uint)W + w) * (uint)(2 * A);
+        uint doutda_base = ((n * (uint)H + h) * (uint)W + w) * (uint)(2 * K);
         uint attr_n_base = n * (uint)V * (uint)A;
 
         float d_udx = 0.0f, d_udy = 0.0f, d_vdx = 0.0f, d_vdy = 0.0f;
-        for (int a = 0; a < A; ++a) {
+        for (int k = 0; k < K; ++k) {
+            int a = diff_idx[k];
             float a0 = attr[attr_n_base + (uint)i0 * (uint)A + (uint)a];
             float a1 = attr[attr_n_base + (uint)i1 * (uint)A + (uint)a];
             float a2 = attr[attr_n_base + (uint)i2 * (uint)A + (uint)a];
             float d01 = a1 - a0;
             float d02 = a2 - a0;
-            float gx = d_out_da[doutda_base + (uint)(2 * a + 0)];
-            float gy = d_out_da[doutda_base + (uint)(2 * a + 1)];
+            float gx = d_out_da[doutda_base + (uint)(2 * k + 0)];
+            float gy = d_out_da[doutda_base + (uint)(2 * k + 1)];
             d_udx += d01 * gx;
             d_udy += d01 * gy;
             d_vdx += d02 * gx;
@@ -390,7 +425,8 @@ extension DiffRast {
 
     private static let fwdDAKernel = MLXFast.metalKernel(
         name: "diffrast_interp_fwd_da",
-        inputNames: ["attr", "rast", "rast_db", "tri"], outputNames: ["out", "out_da"],
+        inputNames: ["attr", "rast", "rast_db", "tri", "diff_idx"],
+        outputNames: ["out", "out_da"],
         source: fwdDASource)
 
     private static let gradAttrKernel = MLXFast.metalKernel(
@@ -400,7 +436,7 @@ extension DiffRast {
 
     private static let gradAttrDAKernel = MLXFast.metalKernel(
         name: "diffrast_interp_grad_attr_da",
-        inputNames: ["attr", "rast", "rast_db", "tri", "d_out", "d_out_da"],
+        inputNames: ["attr", "rast", "rast_db", "tri", "d_out", "d_out_da", "diff_idx"],
         outputNames: ["d_attr"],
         source: gradAttrDASource, atomicOutputs: true)
 
@@ -411,7 +447,8 @@ extension DiffRast {
 
     private static let gradRastDBKernel = MLXFast.metalKernel(
         name: "diffrast_interp_grad_rast_db",
-        inputNames: ["attr", "rast", "tri", "d_out_da"], outputNames: ["d_rast_db"],
+        inputNames: ["attr", "rast", "tri", "d_out_da", "diff_idx"],
+        outputNames: ["d_rast_db"],
         source: gradRastDBSource)
 
     private static let tg = 256
@@ -425,6 +462,12 @@ extension DiffRast {
         -> [(String, any KernelTemplateArg)]
     {
         [("N", N), ("H", H), ("W", W), ("A", A), ("V", V)]
+    }
+
+    private static func tmplDA(N: Int, H: Int, W: Int, A: Int, V: Int, K: Int)
+        -> [(String, any KernelTemplateArg)]
+    {
+        [("N", N), ("H", H), ("W", W), ("A", A), ("V", V), ("K", K)]
     }
 
     // MARK: - Kernel dispatchers
@@ -441,15 +484,17 @@ extension DiffRast {
                          outputDTypes: [.float32])[0]
     }
 
-    private static func fwdDA(attr: MLXArray, rast: MLXArray, rastDB: MLXArray, tri: MLXArray,
-                              N: Int, H: Int, W: Int, A: Int) -> (MLXArray, MLXArray)
-    {
+    private static func fwdDA(
+        attr: MLXArray, rast: MLXArray, rastDB: MLXArray,
+        tri: MLXArray, diffIdx: MLXArray,
+        N: Int, H: Int, W: Int, A: Int, K: Int
+    ) -> (MLXArray, MLXArray) {
         let V = attr.shape[1]
         let (g, t) = gridSpec(N * H * W)
-        let outs = fwdDAKernel([attr, rast, rastDB, tri],
-                               template: tmpl(N: N, H: H, W: W, A: A, V: V),
+        let outs = fwdDAKernel([attr, rast, rastDB, tri, diffIdx],
+                               template: tmplDA(N: N, H: H, W: W, A: A, V: V, K: K),
                                grid: g, threadGroup: t,
-                               outputShapes: [[N, H, W, A], [N, H, W, 2 * A]],
+                               outputShapes: [[N, H, W, A], [N, H, W, 2 * K]],
                                outputDTypes: [.float32, .float32])
         return (outs[0], outs[1])
     }
@@ -472,22 +517,25 @@ extension DiffRast {
     }
 
     private static func bwdDA(
-        attr: MLXArray, rast: MLXArray, rastDB: MLXArray, tri: MLXArray,
+        attr: MLXArray, rast: MLXArray, rastDB: MLXArray,
+        tri: MLXArray, diffIdx: MLXArray,
         dOut: MLXArray, dOutDA: MLXArray,
-        N: Int, H: Int, W: Int, A: Int
+        N: Int, H: Int, W: Int, A: Int, K: Int
     ) -> (MLXArray, MLXArray, MLXArray) {
         let V = attr.shape[1]
         let (g, t) = gridSpec(N * H * W)
-        let tparams = tmpl(N: N, H: H, W: W, A: A, V: V)
-        let dAttr = gradAttrDAKernel([attr, rast, rastDB, tri, dOut, dOutDA],
-                                     template: tparams, grid: g, threadGroup: t,
+        let tparamsDA = tmplDA(N: N, H: H, W: W, A: A, V: V, K: K)
+        let tparamsBasic = tmpl(N: N, H: H, W: W, A: A, V: V)
+        let dAttr = gradAttrDAKernel([attr, rast, rastDB, tri, dOut, dOutDA, diffIdx],
+                                     template: tparamsDA, grid: g, threadGroup: t,
                                      outputShapes: [[N, V, A]], outputDTypes: [.float32],
                                      initValue: 0.0)[0]
+        // d_rast doesn't depend on diff_idx — out_da has no u/v dependence.
         let dRast = gradRastKernel([attr, rast, tri, dOut],
-                                   template: tparams, grid: g, threadGroup: t,
+                                   template: tparamsBasic, grid: g, threadGroup: t,
                                    outputShapes: [[N, H, W, 4]], outputDTypes: [.float32])[0]
-        let dRastDB = gradRastDBKernel([attr, rast, tri, dOutDA],
-                                       template: tparams, grid: g, threadGroup: t,
+        let dRastDB = gradRastDBKernel([attr, rast, tri, dOutDA, diffIdx],
+                                       template: tparamsDA, grid: g, threadGroup: t,
                                        outputShapes: [[N, H, W, 4]], outputDTypes: [.float32])[0]
         return (dAttr, dRast, dRastDB)
     }
