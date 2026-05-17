@@ -156,6 +156,116 @@ extension DiffRast {
                                N: N, V: V, T: T, H: H, W: W)
     }
 
+    // MARK: - Tile binning constants
+
+    /// Pixels per tile edge. 16×16 tiles strike a good balance: small enough
+    /// that per-tile triangle lists stay short for typical meshes, large
+    /// enough that the binning overhead doesn't dominate.
+    private static let TILE_SIZE = 16
+
+    /// Maximum triangles tracked per tile. Bin lists overflow silently
+    /// (extra triangles get dropped) above this — increase if you see
+    /// missing geometry on very dense meshes. 128 covers up to ~10⁵ tri
+    /// meshes with reasonable tile coverage; cost is `num_tiles · 129 · 4`
+    /// bytes per batch.
+    private static let MAX_PER_TILE = 128
+
+    // MARK: - Tile binning kernel
+
+    /// One thread per `(batch, triangle)`. Computes the screen-space AABB
+    /// (using the precomputed NDC vertices), converts to tile coordinates,
+    /// and atomically appends the triangle's index into every tile its AABB
+    /// touches. Output layout per batch:
+    ///   `bins[t, 0]`       = count (number of triangles in this tile)
+    ///   `bins[t, 1..k]`    = triangle indices
+    /// Overflow above `MAX_PER_TILE` is silently dropped.
+    private static let binSource = """
+        uint idx = thread_position_in_grid.x;
+        uint total = (uint)N * (uint)T;
+        if (idx >= total) return;
+
+        uint tri_idx = idx % (uint)T;
+        uint pn = idx / (uint)T;
+
+        uint tb = (pn * (uint)T + tri_idx) * 10u;
+        float area = screen_data[tb + 9];
+        if (area == 0.0f) return;
+
+        float sx0 = screen_data[tb + 0], sy0 = screen_data[tb + 1];
+        float sx1 = screen_data[tb + 3], sy1 = screen_data[tb + 4];
+        float sx2 = screen_data[tb + 6], sy2 = screen_data[tb + 7];
+
+        // Screen-space NDC AABB.
+        float minx_ndc = fmin(sx0, fmin(sx1, sx2));
+        float maxx_ndc = fmax(sx0, fmax(sx1, sx2));
+        float miny_ndc = fmin(sy0, fmin(sy1, sy2));
+        float maxy_ndc = fmax(sy0, fmax(sy1, sy2));
+
+        // NDC → pixel coords. NDC y flips: y_ndc = +1 is top (ph = 0).
+        float px_min = (minx_ndc + 1.0f) * (float)W * 0.5f - 0.5f;
+        float px_max = (maxx_ndc + 1.0f) * (float)W * 0.5f - 0.5f;
+        float py_min = (1.0f - maxy_ndc) * (float)H * 0.5f - 0.5f;
+        float py_max = (1.0f - miny_ndc) * (float)H * 0.5f - 0.5f;
+
+        int pxmin_i = (int)floor(px_min);
+        int pxmax_i = (int)floor(px_max);
+        int pymin_i = (int)floor(py_min);
+        int pymax_i = (int)floor(py_max);
+        if (pxmin_i < 0) pxmin_i = 0;
+        if (pxmax_i >= W) pxmax_i = W - 1;
+        if (pymin_i < 0) pymin_i = 0;
+        if (pymax_i >= H) pymax_i = H - 1;
+        if (pxmin_i > pxmax_i || pymin_i > pymax_i) return;
+
+        int tile_xmin = pxmin_i / TILE_SIZE;
+        int tile_xmax = pxmax_i / TILE_SIZE;
+        int tile_ymin = pymin_i / TILE_SIZE;
+        int tile_ymax = pymax_i / TILE_SIZE;
+
+        uint stride = (uint)(MAX_PER_TILE + 1);
+        uint batch_base = pn * (uint)NUM_TILES_X * (uint)NUM_TILES_Y * stride;
+        for (int ty = tile_ymin; ty <= tile_ymax; ++ty) {
+            for (int tx = tile_xmin; tx <= tile_xmax; ++tx) {
+                uint tile_idx = (uint)ty * (uint)NUM_TILES_X + (uint)tx;
+                uint slot_base = batch_base + tile_idx * stride;
+                int slot = atomic_fetch_add_explicit(
+                    &bins[slot_base], 1, memory_order_relaxed);
+                if (slot < MAX_PER_TILE) {
+                    atomic_store_explicit(
+                        &bins[slot_base + 1u + (uint)slot],
+                        (int)tri_idx, memory_order_relaxed);
+                }
+            }
+        }
+    """
+
+    private static let binKernel = MLXFast.metalKernel(
+        name: "diffrast_rasterize_bin",
+        inputNames: ["screen_data"], outputNames: ["bins"],
+        source: binSource, atomicOutputs: true)
+
+    private static func rasterizeBin(
+        screen: MLXArray, N: Int, T: Int, H: Int, W: Int,
+        numTilesX: Int, numTilesY: Int
+    ) -> MLXArray {
+        let total = N * T
+        let rounded = ((total + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
+        let stride = MAX_PER_TILE + 1
+        let binSize = N * numTilesX * numTilesY * stride
+        // Output is int32 atomic; initValue 0 fills the count + index slots.
+        return binKernel(
+            [screen],
+            template: [("N", N), ("T", T), ("H", H), ("W", W),
+                       ("NUM_TILES_X", numTilesX), ("NUM_TILES_Y", numTilesY),
+                       ("TILE_SIZE", TILE_SIZE), ("MAX_PER_TILE", MAX_PER_TILE)],
+            grid: (rounded, 1, 1),
+            threadGroup: (rasterizeTG, 1, 1),
+            outputShapes: [[binSize]],
+            outputDTypes: [.int32],
+            initValue: 0.0
+        )[0]
+    }
+
     // MARK: - Precompute (per-triangle screen-space data)
 
     /// One thread per `(batch, triangle)`. Does the perspective divide once
@@ -286,7 +396,21 @@ extension DiffRast {
         float best_u = 0.0f;
         float best_v = 0.0f;
 
-        for (int t = 0; t < T; ++t) {
+        // Tile-bin lookup — iterate only the triangles whose AABB touches
+        // this pixel's tile (vs the entire mesh). The binning kernel
+        // populated `bins`: bins[tile, 0] is the count, bins[tile, 1..k]
+        // are triangle indices.
+        int tile_x = (int)pw / TILE_SIZE;
+        int tile_y = (int)ph / TILE_SIZE;
+        uint stride = (uint)(MAX_PER_TILE + 1);
+        uint batch_base_b = pn * (uint)NUM_TILES_X * (uint)NUM_TILES_Y * stride;
+        uint tile_idx = (uint)tile_y * (uint)NUM_TILES_X + (uint)tile_x;
+        uint tile_base = batch_base_b + tile_idx * stride;
+        int tile_count = bins[tile_base];
+        if (tile_count > MAX_PER_TILE) tile_count = MAX_PER_TILE;
+
+        for (int i = 0; i < tile_count; ++i) {
+            int t = bins[tile_base + 1u + (uint)i];
             uint tb = (pn * (uint)T + (uint)t) * 10u;
             // Precompute marks invalid triangles (any w ≤ 0 or zero area) by
             // setting area = 0; skip them without further work.
@@ -384,7 +508,21 @@ extension DiffRast {
         float best_u = 0.0f;
         float best_v = 0.0f;
 
-        for (int t = 0; t < T; ++t) {
+        // Tile-bin lookup — iterate only the triangles whose AABB touches
+        // this pixel's tile (vs the entire mesh). The binning kernel
+        // populated `bins`: bins[tile, 0] is the count, bins[tile, 1..k]
+        // are triangle indices.
+        int tile_x = (int)pw / TILE_SIZE;
+        int tile_y = (int)ph / TILE_SIZE;
+        uint stride = (uint)(MAX_PER_TILE + 1);
+        uint batch_base_b = pn * (uint)NUM_TILES_X * (uint)NUM_TILES_Y * stride;
+        uint tile_idx = (uint)tile_y * (uint)NUM_TILES_X + (uint)tile_x;
+        uint tile_base = batch_base_b + tile_idx * stride;
+        int tile_count = bins[tile_base];
+        if (tile_count > MAX_PER_TILE) tile_count = MAX_PER_TILE;
+
+        for (int i = 0; i < tile_count; ++i) {
+            int t = bins[tile_base + 1u + (uint)i];
             uint tb = (pn * (uint)T + (uint)t) * 10u;
             float area = screen_data[tb + 9];
             if (area == 0.0f) continue;
@@ -462,12 +600,12 @@ extension DiffRast {
 
     private static let fwdKernel = MLXFast.metalKernel(
         name: "diffrast_rasterize_fwd",
-        inputNames: ["screen_data", "peel_layer"], outputNames: ["out"],
+        inputNames: ["screen_data", "bins", "peel_layer"], outputNames: ["out"],
         source: fwdSource)
 
     private static let fwdDBKernel = MLXFast.metalKernel(
         name: "diffrast_rasterize_fwd_db",
-        inputNames: ["screen_data", "peel_layer"], outputNames: ["out", "out_db"],
+        inputNames: ["screen_data", "bins", "peel_layer"], outputNames: ["out", "out_db"],
         source: fwdDBSource)
 
     // MARK: - Backward kernel (M2.3)
@@ -689,12 +827,19 @@ extension DiffRast {
     ) -> MLXArray {
         let screen = rasterizePrecompute(pos: pos, tri: tri, ranges: ranges,
                                          N: N, V: V, T: T)
+        let numTilesX = (W + TILE_SIZE - 1) / TILE_SIZE
+        let numTilesY = (H + TILE_SIZE - 1) / TILE_SIZE
+        let bins = rasterizeBin(screen: screen, N: N, T: T, H: H, W: W,
+                                 numTilesX: numTilesX, numTilesY: numTilesY)
         let pixels = N * H * W
         let rounded = ((pixels + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         return fwdKernel(
-            [screen, peelLayer],
+            [screen, bins, peelLayer],
             template: [("N", N), ("V", V), ("T", T), ("H", H), ("W", W),
-                       ("PEEL", peelEnabled)],
+                       ("PEEL", peelEnabled),
+                       ("TILE_SIZE", TILE_SIZE),
+                       ("MAX_PER_TILE", MAX_PER_TILE),
+                       ("NUM_TILES_X", numTilesX), ("NUM_TILES_Y", numTilesY)],
             grid: (rounded, 1, 1),
             threadGroup: (rasterizeTG, 1, 1),
             outputShapes: [[N, H, W, 4]],
@@ -727,12 +872,19 @@ extension DiffRast {
     ) -> (MLXArray, MLXArray) {
         let screen = rasterizePrecompute(pos: pos, tri: tri, ranges: ranges,
                                          N: N, V: V, T: T)
+        let numTilesX = (W + TILE_SIZE - 1) / TILE_SIZE
+        let numTilesY = (H + TILE_SIZE - 1) / TILE_SIZE
+        let bins = rasterizeBin(screen: screen, N: N, T: T, H: H, W: W,
+                                 numTilesX: numTilesX, numTilesY: numTilesY)
         let pixels = N * H * W
         let rounded = ((pixels + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         let outs = fwdDBKernel(
-            [screen, peelLayer],
+            [screen, bins, peelLayer],
             template: [("N", N), ("V", V), ("T", T), ("H", H), ("W", W),
-                       ("PEEL", peelEnabled)],
+                       ("PEEL", peelEnabled),
+                       ("TILE_SIZE", TILE_SIZE),
+                       ("MAX_PER_TILE", MAX_PER_TILE),
+                       ("NUM_TILES_X", numTilesX), ("NUM_TILES_Y", numTilesY)],
             grid: (rounded, 1, 1),
             threadGroup: (rasterizeTG, 1, 1),
             outputShapes: [[N, H, W, 4], [N, H, W, 4]],

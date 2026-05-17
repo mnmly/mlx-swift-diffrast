@@ -112,10 +112,21 @@ from any given pixel.
 - [x] Backward unchanged (per-pixel winner lookup from `rast[3]` works the
       same regardless of which layer was selected).
 
-#### Deferred
-- [ ] True per-tile bin lists (one allocator pass + one rasterize pass) — the
-      next step beyond AABB rejection when triangle counts go past ~10⁴ and
-      the per-triangle screen reads start to dominate.
+#### M2.7 — Tile-based binning (✅ DONE)
+- [x] New per-(batch, triangle) binning kernel computes screen-space AABB
+      (NDC → pixel coords) and atomically appends the triangle index into
+      every 16×16 tile its AABB touches.
+- [x] Bin storage: `[N, num_tiles, MAX_PER_TILE+1]` int32, with
+      `bins[t, 0]` = count and `bins[t, 1..k]` = triangle indices. Overflow
+      above `MAX_PER_TILE = 128` is silently dropped.
+- [x] Rasterize `fwd` / `fwd_db` kernels now iterate over `bins[tile]`
+      instead of all T triangles. Per-pixel AABB rejection is still in place
+      since a tile is 16×16 pixels and a triangle can overlap the tile but
+      miss many of its pixels.
+- [x] All 54 tests still pass + 3 inverse-rendering samples converge
+      unchanged. The benefit kicks in for meshes with many triangles
+      distributed across the image — instead of O(H·W·T) cost, the per-pixel
+      loop is O(H·W·k) where k is the average triangles-per-tile.
 
 ### M3 — `texture`
 
