@@ -75,11 +75,28 @@ perturbations, making FD wildly disagree with the (correct) smooth-interior
 analytic gradient. See `fullCoverPos()` for a triangle with edges >0.5 NDC
 from every pixel center.
 
+#### M2.4 — Precompute + AABB rejection (✅ DONE)
+- [x] New `precomputeTriDataKernel`: per-(batch, triangle) thread does the
+      perspective divide **once** and packs `(sxk, syk, szk for k=0..2, area)`
+      as `[N, T, 10]`. Used by both `fwd` and `fwd_db` kernels — no more
+      per-pixel perspective divides inside the inner loop.
+- [x] Inline AABB rejection — compute `min(sx*), max(sx*), min(sy*), max(sy*)`
+      from the precomputed screen verts and skip the edge tests for triangles
+      whose screen AABB doesn't contain the pixel.
+- [x] Backward unchanged (it doesn't iterate triangles).
+- [x] All 40 tests + 3 inverse-rendering samples still pass / converge.
+
+The most user-visible perf win without the bin-list complexity. For large
+meshes the inner loop becomes dominated by 4 float comparisons (the AABB
+reject) for the vast majority of triangles, since most triangles are far
+from any given pixel.
+
 #### Deferred
 - [ ] Range mode (`pos` shape `[V, 4]` + `ranges` tensor)
 - [ ] `DepthPeeler` analog for transparency
-- [ ] Replace per-pixel ∀-triangle loop with a tile-based hierarchical pass
-      when triangle counts grow beyond a few thousand
+- [ ] True per-tile bin lists (one allocator pass + one rasterize pass) — the
+      next step beyond AABB rejection when triangle counts go past ~10⁴ and
+      the per-triangle screen reads start to dominate.
 
 ### M3 — `texture`
 

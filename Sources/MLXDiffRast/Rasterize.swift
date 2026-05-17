@@ -94,6 +94,80 @@ extension DiffRast {
         rasterizeForwardKernel(pos: pos, tri: tri, N: N, V: V, T: T, H: H, W: W)
     }
 
+    // MARK: - Precompute (per-triangle screen-space data)
+
+    /// One thread per `(batch, triangle)`. Does the perspective divide once
+    /// per triangle (instead of once per pixel × per triangle) and emits a
+    /// compact 10-float record:
+    ///   `(sx0, sy0, sz0, sx1, sy1, sz1, sx2, sy2, sz2, area)`
+    /// Triangles with any `w ≤ 0` or zero signed area get `area = 0`, which
+    /// the forward kernels skip immediately. This is the main perf knob:
+    /// the rasterize forward used to redo a perspective divide for every
+    /// `(pixel, triangle)` pair; now it just reads pre-computed screen
+    /// coords and does AABB rejection before the (expensive) edge tests.
+    private static let precomputeSource = """
+        uint idx = thread_position_in_grid.x;
+        uint total = (uint)N * (uint)T;
+        if (idx >= total) return;
+
+        uint tri_idx = idx % (uint)T;
+        uint pn = idx / (uint)T;
+
+        int i0 = tri[tri_idx * 3 + 0];
+        int i1 = tri[tri_idx * 3 + 1];
+        int i2 = tri[tri_idx * 3 + 2];
+
+        uint pos_n_base = pn * (uint)V * 4u;
+        uint out_base = (pn * (uint)T + tri_idx) * 10u;
+
+        float w0 = pos[pos_n_base + (uint)i0 * 4u + 3];
+        float w1 = pos[pos_n_base + (uint)i1 * 4u + 3];
+        float w2 = pos[pos_n_base + (uint)i2 * 4u + 3];
+
+        if (w0 <= 0.0f || w1 <= 0.0f || w2 <= 0.0f) {
+            for (int k = 0; k < 10; ++k) out[out_base + (uint)k] = 0.0f;
+            return;
+        }
+
+        float sx0 = pos[pos_n_base + (uint)i0 * 4u + 0] / w0;
+        float sy0 = pos[pos_n_base + (uint)i0 * 4u + 1] / w0;
+        float sz0 = pos[pos_n_base + (uint)i0 * 4u + 2] / w0;
+        float sx1 = pos[pos_n_base + (uint)i1 * 4u + 0] / w1;
+        float sy1 = pos[pos_n_base + (uint)i1 * 4u + 1] / w1;
+        float sz1 = pos[pos_n_base + (uint)i1 * 4u + 2] / w1;
+        float sx2 = pos[pos_n_base + (uint)i2 * 4u + 0] / w2;
+        float sy2 = pos[pos_n_base + (uint)i2 * 4u + 1] / w2;
+        float sz2 = pos[pos_n_base + (uint)i2 * 4u + 2] / w2;
+
+        float area = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
+
+        out[out_base + 0] = sx0; out[out_base + 1] = sy0; out[out_base + 2] = sz0;
+        out[out_base + 3] = sx1; out[out_base + 4] = sy1; out[out_base + 5] = sz1;
+        out[out_base + 6] = sx2; out[out_base + 7] = sy2; out[out_base + 8] = sz2;
+        out[out_base + 9] = area;
+    """
+
+    private static let precomputeKernel = MLXFast.metalKernel(
+        name: "diffrast_rasterize_precompute",
+        inputNames: ["pos", "tri"], outputNames: ["out"],
+        source: precomputeSource)
+
+    private static func rasterizePrecompute(
+        pos: MLXArray, tri: MLXArray,
+        N: Int, V: Int, T: Int
+    ) -> MLXArray {
+        let total = N * T
+        let rounded = ((total + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
+        return precomputeKernel(
+            [pos, tri],
+            template: [("N", N), ("V", V), ("T", T)],
+            grid: (rounded, 1, 1),
+            threadGroup: (rasterizeTG, 1, 1),
+            outputShapes: [[N, T, 10]],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
     // MARK: - Forward kernel
 
     /// Per-pixel rasterization. One thread per pixel; iterate over every triangle.
@@ -132,39 +206,28 @@ extension DiffRast {
         float best_u = 0.0f;
         float best_v = 0.0f;
 
-        uint pos_n_base = pn * (uint)V * 4u;
-
         for (int t = 0; t < T; ++t) {
-            int i0 = tri[t * 3 + 0];
-            int i1 = tri[t * 3 + 1];
-            int i2 = tri[t * 3 + 2];
-
-            float x0 = pos[pos_n_base + (uint)i0 * 4u + 0];
-            float y0 = pos[pos_n_base + (uint)i0 * 4u + 1];
-            float z0 = pos[pos_n_base + (uint)i0 * 4u + 2];
-            float w0 = pos[pos_n_base + (uint)i0 * 4u + 3];
-
-            float x1 = pos[pos_n_base + (uint)i1 * 4u + 0];
-            float y1 = pos[pos_n_base + (uint)i1 * 4u + 1];
-            float z1 = pos[pos_n_base + (uint)i1 * 4u + 2];
-            float w1 = pos[pos_n_base + (uint)i1 * 4u + 3];
-
-            float x2 = pos[pos_n_base + (uint)i2 * 4u + 0];
-            float y2 = pos[pos_n_base + (uint)i2 * 4u + 1];
-            float z2 = pos[pos_n_base + (uint)i2 * 4u + 2];
-            float w2 = pos[pos_n_base + (uint)i2 * 4u + 3];
-
-            // Reject if any vertex is behind the eye (w <= 0).
-            if (w0 <= 0.0f || w1 <= 0.0f || w2 <= 0.0f) continue;
-
-            // Perspective divide → NDC screen-space xy and z.
-            float sx0 = x0 / w0, sy0 = y0 / w0, sz0 = z0 / w0;
-            float sx1 = x1 / w1, sy1 = y1 / w1, sz1 = z1 / w1;
-            float sx2 = x2 / w2, sy2 = y2 / w2, sz2 = z2 / w2;
-
-            // Signed area (twice the area, sign indicates winding).
-            float area = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
+            uint tb = (pn * (uint)T + (uint)t) * 10u;
+            // Precompute marks invalid triangles (any w ≤ 0 or zero area) by
+            // setting area = 0; skip them without further work.
+            float area = screen_data[tb + 9];
             if (area == 0.0f) continue;
+
+            float sx0 = screen_data[tb + 0], sy0 = screen_data[tb + 1], sz0 = screen_data[tb + 2];
+            float sx1 = screen_data[tb + 3], sy1 = screen_data[tb + 4], sz1 = screen_data[tb + 5];
+            float sx2 = screen_data[tb + 6], sy2 = screen_data[tb + 7], sz2 = screen_data[tb + 8];
+
+            // AABB rejection — cheapest way to skip far triangles before the
+            // edge-function tests.
+            float minx = fmin(sx0, fmin(sx1, sx2));
+            if (ndc_x < minx) continue;
+            float maxx = fmax(sx0, fmax(sx1, sx2));
+            if (ndc_x > maxx) continue;
+            float miny = fmin(sy0, fmin(sy1, sy2));
+            if (ndc_y < miny) continue;
+            float maxy = fmax(sy0, fmax(sy1, sy2));
+            if (ndc_y > maxy) continue;
+
             float inv_area = 1.0f / area;
 
             // Edge functions at the pixel. Each e_i has sign matching area iff the
@@ -233,34 +296,24 @@ extension DiffRast {
         float best_u = 0.0f;
         float best_v = 0.0f;
 
-        uint pos_n_base = pn * (uint)V * 4u;
-
         for (int t = 0; t < T; ++t) {
-            int i0 = tri[t * 3 + 0];
-            int i1 = tri[t * 3 + 1];
-            int i2 = tri[t * 3 + 2];
-
-            float x0 = pos[pos_n_base + (uint)i0 * 4u + 0];
-            float y0 = pos[pos_n_base + (uint)i0 * 4u + 1];
-            float z0 = pos[pos_n_base + (uint)i0 * 4u + 2];
-            float w0 = pos[pos_n_base + (uint)i0 * 4u + 3];
-            float x1 = pos[pos_n_base + (uint)i1 * 4u + 0];
-            float y1 = pos[pos_n_base + (uint)i1 * 4u + 1];
-            float z1 = pos[pos_n_base + (uint)i1 * 4u + 2];
-            float w1 = pos[pos_n_base + (uint)i1 * 4u + 3];
-            float x2 = pos[pos_n_base + (uint)i2 * 4u + 0];
-            float y2 = pos[pos_n_base + (uint)i2 * 4u + 1];
-            float z2 = pos[pos_n_base + (uint)i2 * 4u + 2];
-            float w2 = pos[pos_n_base + (uint)i2 * 4u + 3];
-
-            if (w0 <= 0.0f || w1 <= 0.0f || w2 <= 0.0f) continue;
-
-            float sx0 = x0 / w0, sy0 = y0 / w0, sz0 = z0 / w0;
-            float sx1 = x1 / w1, sy1 = y1 / w1, sz1 = z1 / w1;
-            float sx2 = x2 / w2, sy2 = y2 / w2, sz2 = z2 / w2;
-
-            float area = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
+            uint tb = (pn * (uint)T + (uint)t) * 10u;
+            float area = screen_data[tb + 9];
             if (area == 0.0f) continue;
+
+            float sx0 = screen_data[tb + 0], sy0 = screen_data[tb + 1], sz0 = screen_data[tb + 2];
+            float sx1 = screen_data[tb + 3], sy1 = screen_data[tb + 4], sz1 = screen_data[tb + 5];
+            float sx2 = screen_data[tb + 6], sy2 = screen_data[tb + 7], sz2 = screen_data[tb + 8];
+
+            float minx = fmin(sx0, fmin(sx1, sx2));
+            if (ndc_x < minx) continue;
+            float maxx = fmax(sx0, fmax(sx1, sx2));
+            if (ndc_x > maxx) continue;
+            float miny = fmin(sy0, fmin(sy1, sy2));
+            if (ndc_y < miny) continue;
+            float maxy = fmax(sy0, fmax(sy1, sy2));
+            if (ndc_y > maxy) continue;
+
             float inv_area = 1.0f / area;
 
             float e0 = (sx1 - ndc_x) * (sy2 - ndc_y) - (sx2 - ndc_x) * (sy1 - ndc_y);
@@ -302,20 +355,12 @@ extension DiffRast {
         out[out_base + 2] = best_z;
         out[out_base + 3] = (float)(best_t + 1);
 
-        // Recompute screen-space vertices for the winning triangle to derive rast_db.
-        int i0 = tri[best_t * 3 + 0];
-        int i1 = tri[best_t * 3 + 1];
-        int i2 = tri[best_t * 3 + 2];
-        float w0 = pos[pos_n_base + (uint)i0 * 4u + 3];
-        float w1 = pos[pos_n_base + (uint)i1 * 4u + 3];
-        float w2 = pos[pos_n_base + (uint)i2 * 4u + 3];
-        float sx0 = pos[pos_n_base + (uint)i0 * 4u + 0] / w0;
-        float sy0 = pos[pos_n_base + (uint)i0 * 4u + 1] / w0;
-        float sx1 = pos[pos_n_base + (uint)i1 * 4u + 0] / w1;
-        float sy1 = pos[pos_n_base + (uint)i1 * 4u + 1] / w1;
-        float sx2 = pos[pos_n_base + (uint)i2 * 4u + 0] / w2;
-        float sy2 = pos[pos_n_base + (uint)i2 * 4u + 1] / w2;
-        float area = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
+        // Look up the winner's pre-computed screen-space data for rast_db.
+        uint tb_w = (pn * (uint)T + (uint)best_t) * 10u;
+        float sx0 = screen_data[tb_w + 0], sy0 = screen_data[tb_w + 1];
+        float sx1 = screen_data[tb_w + 3], sy1 = screen_data[tb_w + 4];
+        float sx2 = screen_data[tb_w + 6], sy2 = screen_data[tb_w + 7];
+        float area = screen_data[tb_w + 9];
         float inv_area = 1.0f / area;
         float k_x = 2.0f / (float)W;
         float k_y = -2.0f / (float)H;
@@ -328,12 +373,12 @@ extension DiffRast {
 
     private static let fwdKernel = MLXFast.metalKernel(
         name: "diffrast_rasterize_fwd",
-        inputNames: ["pos", "tri"], outputNames: ["out"],
+        inputNames: ["screen_data"], outputNames: ["out"],
         source: fwdSource)
 
     private static let fwdDBKernel = MLXFast.metalKernel(
         name: "diffrast_rasterize_fwd_db",
-        inputNames: ["pos", "tri"], outputNames: ["out", "out_db"],
+        inputNames: ["screen_data"], outputNames: ["out", "out_db"],
         source: fwdDBSource)
 
     // MARK: - Backward kernel (M2.3)
@@ -552,10 +597,11 @@ extension DiffRast {
         pos: MLXArray, tri: MLXArray,
         N: Int, V: Int, T: Int, H: Int, W: Int
     ) -> MLXArray {
+        let screen = rasterizePrecompute(pos: pos, tri: tri, N: N, V: V, T: T)
         let pixels = N * H * W
         let rounded = ((pixels + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         return fwdKernel(
-            [pos, tri],
+            [screen],
             template: [("N", N), ("V", V), ("T", T), ("H", H), ("W", W)],
             grid: (rounded, 1, 1),
             threadGroup: (rasterizeTG, 1, 1),
@@ -586,10 +632,11 @@ extension DiffRast {
         pos: MLXArray, tri: MLXArray,
         N: Int, V: Int, T: Int, H: Int, W: Int
     ) -> (MLXArray, MLXArray) {
+        let screen = rasterizePrecompute(pos: pos, tri: tri, N: N, V: V, T: T)
         let pixels = N * H * W
         let rounded = ((pixels + rasterizeTG - 1) / rasterizeTG) * rasterizeTG
         let outs = fwdDBKernel(
-            [pos, tri],
+            [screen],
             template: [("N", N), ("V", V), ("T", T), ("H", H), ("W", W)],
             grid: (rounded, 1, 1),
             threadGroup: (rasterizeTG, 1, 1),
