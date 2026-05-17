@@ -124,6 +124,31 @@ the `constant`/`device` qualifier matching on kernel-input pointers are
 both fragile across the Swift→Metal source boundary. See
 `silhouetteBlock` in `Antialias.swift` for the working pattern.
 
+### Examples / inverse-rendering samples (✅ DONE)
+- [x] Tier 1: `ColorFitExample` — per-vertex color recovery (loss 0.028 → 0)
+- [x] Tier 2: `PoseFitExample` — vertex position recovery via silhouette
+      gradient (loss 0.034 → 0.0007)
+- [x] Tier 3: `MeshFitExample` — 7-vertex / 6-triangle hexagonal pie mesh fit
+      with topology-aware silhouettes (loss → 0.000184)
+- [x] Shared `MLXDiffRastExamples` library: animated-GIF writer (ImageIO),
+      MLXArray→CGImage, simple Adam
+
+**Antialias semantic bugs found and fixed via the samples** (each invisible
+to the M4.2 / M4.3 gradchecks because forward+VJP were self-consistently
+wrong):
+- Pixel-projection formula had a spurious `-0.5` offset → silhouette edges
+  were positioned half a pixel wrong.
+- `fg_center_{x,y}` used `pw`/`ph` (this pixel) instead of `nw`/`nh` (the
+  neighbor, which is the actual foreground pixel when p is bg).
+- Algorithm picked the wrong pixel of the pair to blend: nvdiffrast blends
+  whichever pixel has the silhouette edge cutting its *interior*, not
+  necessarily the rast-empty one. Replaced with the canonical `β = 0.5 -
+  |xe - (pw+0.5)|` formulation.
+- Boundary-edge selection picked the first `topology[k] == target` match,
+  which is wrong when a triangle has multiple boundary edges. Now picks the
+  candidate whose extension geometrically separates `p_center` from
+  `neighbor_center` (signed-cross-product test).
+
 #### M4.3 — `pos` backward (✅ DONE — the killer-feature gradient)
 - [x] Chain rule:
         `d_loss/d_α` → `d_α/d_(xe|ye)` → `d_(xe|ye)/d_e{0,1}` (line-intersection

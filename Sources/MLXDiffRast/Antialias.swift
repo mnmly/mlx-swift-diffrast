@@ -131,9 +131,29 @@ extension DiffRast {
     """
 
     /// Reused once each in `fwdSource`, `bwdColorSource`, and `bwdPosSource`.
-    /// Stashes per-direction state (α, neighbor color base, edge endpoints,
-    /// parameter t, denominator, sign) used by the pos backward; forward and
-    /// color backward consume only a subset (the rest gets DCE'd).
+    ///
+    /// **Algorithm:** for each pixel p and each of its 4 neighbors:
+    ///   1. If they share a tri-id (or are both empty), skip.
+    ///   2. Validate via `topologyHash` that this is a true silhouette pair.
+    ///   3. Project the silhouette edge to pixel-space (`e.x = (NDC+1)·W/2`,
+    ///      `e.y = (1-NDC)·H/2`, *no* extra `-0.5` offset — pixel centers sit
+    ///      at integer-plus-half).
+    ///   4. Find where the edge crosses p's row centerline (for horizontal
+    ///      neighbors) or column centerline (for vertical neighbors).
+    ///   5. If the crossing `xe` falls inside p's own pixel range `[pw, pw+1]`,
+    ///      the edge cuts p's interior. The smaller of the two split portions
+    ///      is the "wrong-coverage" fraction:
+    ///        β = 0.5 - |xe - (pw + 0.5)|   (clamped to [0, 0.5])
+    ///      Blend p's color toward the neighbor's by β.
+    ///
+    /// This differs from a naive "always-blend-the-empty-pixel" scheme: the
+    /// pixel that gets blended is the one whose *interior* is cut by the
+    /// silhouette edge, which may be the rast-fg pixel just as well as the
+    /// rast-bg one — and only ever one of them per pair (the edge crosses at
+    /// exactly one location, in exactly one of the pair's two pixels).
+    ///
+    /// Stashes per-direction state used downstream by `bwdPos`; forward and
+    /// `bwdColor` ignore the extras (Metal DCEs them).
     private static let silhouetteBlock = """
         int tri_p = (int)rast[rast_base + 3] - 1;
         uint pos_n_base = pn * (uint)V * 4u;
@@ -143,7 +163,7 @@ extension DiffRast {
         bool  active_arr[4] = {false, false, false, false};
         float alpha_sum_local = 0.0f;
 
-        // Extended state — used by bwdPos. DCE-friendly when unused.
+        // Per-direction state for the pos backward (chain rule through xe).
         int   i_e0_arr[4] = {-1, -1, -1, -1};
         int   i_e1_arr[4] = {-1, -1, -1, -1};
         float e0x_arr[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -152,7 +172,7 @@ extension DiffRast {
         float e1y_arr[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
         float t_arr[4]    = {0.0f, 0.0f, 0.0f, 0.0f};
         float denom_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // dy (horizontal) or dx (vertical)
-        float dalpha_dxy_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // d_α / d_xe (or d_ye)
+        float dalpha_dxy_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // d_β / d_xe (or d_ye), ±1
         bool  is_horiz_arr[4] = {false, false, false, false};
 
         for (int dir = 0; dir < 4; ++dir) {
@@ -172,99 +192,116 @@ extension DiffRast {
             if (tri_p == tri_n) continue;
             if (tri_p < 0 && tri_n < 0) continue;
 
+            // Identify the foreground triangle of the pair + the silhouette edge.
             int fg_tri, target;
-            bool p_is_bg;
             if (tri_p >= 0 && tri_n >= 0) {
+                // Both covered: silhouette only if they share an edge.
                 int k_at_p = -1;
                 if (topology[tri_p * 3 + 0] == tri_n) k_at_p = 0;
                 else if (topology[tri_p * 3 + 1] == tri_n) k_at_p = 1;
                 else if (topology[tri_p * 3 + 2] == tri_n) k_at_p = 2;
                 if (k_at_p < 0) continue;
-                fg_tri = tri_n; target = tri_p; p_is_bg = true;
+                // Use whichever triangle p belongs to as fg; the silhouette
+                // edge is shared, so the edge endpoints are identical either
+                // way. tri_p is fg here.
+                fg_tri = tri_p; target = tri_n;
             } else if (tri_p >= 0) {
-                fg_tri = tri_p; target = -1; p_is_bg = false;
+                fg_tri = tri_p; target = -1;
             } else {
-                fg_tri = tri_n; target = -1; p_is_bg = true;
+                fg_tri = tri_n; target = -1;
             }
-            if (!p_is_bg) continue;
 
-            int k = -1;
-            if (topology[fg_tri * 3 + 0] == target) k = 0;
-            else if (topology[fg_tri * 3 + 1] == target) k = 1;
-            else if (topology[fg_tri * 3 + 2] == target) k = 2;
-            if (k < 0) continue;
-
-            int i_e0 = tri[fg_tri * 3 + ((k + 1) % 3)];
-            int i_e1 = tri[fg_tri * 3 + ((k + 2) % 3)];
-
-            float w0 = pos[pos_n_base + (uint)i_e0 * 4u + 3];
-            float w1 = pos[pos_n_base + (uint)i_e1 * 4u + 3];
+            // Edge selection — among candidate edges (those whose topology
+            // entry matches `target`), pick the one whose line geometrically
+            // separates p's center from the neighbor's center. For the
+            // both-covered case there's only one candidate (the shared edge);
+            // for boundary silhouettes there can be 2–3 boundary edges per
+            // triangle and only one of them is the actual silhouette in this
+            // pair's pixel pair.
+            int i_e0 = -1, i_e1 = -1;
             PixelXY e0, e1;
-            e0.x = (pos[pos_n_base + (uint)i_e0 * 4u + 0] / w0 + 1.0f) * (float)W * 0.5f - 0.5f;
-            e0.y = (1.0f - pos[pos_n_base + (uint)i_e0 * 4u + 1] / w0) * (float)H * 0.5f - 0.5f;
-            e1.x = (pos[pos_n_base + (uint)i_e1 * 4u + 0] / w1 + 1.0f) * (float)W * 0.5f - 0.5f;
-            e1.y = (1.0f - pos[pos_n_base + (uint)i_e1 * 4u + 1] / w1) * (float)H * 0.5f - 0.5f;
+            {
+                float pcx = (float)pw + 0.5f;
+                float pcy = (float)ph + 0.5f;
+                float ncx = (float)nw + 0.5f;
+                float ncy = (float)nh + 0.5f;
+                int k_sel = -1;
+                for (int kk = 0; kk < 3; ++kk) {
+                    if (topology[fg_tri * 3 + kk] != target) continue;
+                    int ie0_cand = tri[fg_tri * 3 + ((kk + 1) % 3)];
+                    int ie1_cand = tri[fg_tri * 3 + ((kk + 2) % 3)];
+                    float wc0 = pos[pos_n_base + (uint)ie0_cand * 4u + 3];
+                    float wc1 = pos[pos_n_base + (uint)ie1_cand * 4u + 3];
+                    PixelXY E0, E1;
+                    E0.x = (pos[pos_n_base + (uint)ie0_cand * 4u + 0] / wc0 + 1.0f) * (float)W * 0.5f;
+                    E0.y = (1.0f - pos[pos_n_base + (uint)ie0_cand * 4u + 1] / wc0) * (float)H * 0.5f;
+                    E1.x = (pos[pos_n_base + (uint)ie1_cand * 4u + 0] / wc1 + 1.0f) * (float)W * 0.5f;
+                    E1.y = (1.0f - pos[pos_n_base + (uint)ie1_cand * 4u + 1] / wc1) * (float)H * 0.5f;
+                    float ex = E1.x - E0.x;
+                    float ey = E1.y - E0.y;
+                    // Signed cross products: which side of edge each center is on.
+                    float side_p = ex * (pcy - E0.y) - ey * (pcx - E0.x);
+                    float side_n = ex * (ncy - E0.y) - ey * (ncx - E0.x);
+                    if (side_p * side_n < 0.0f) {
+                        k_sel = kk;
+                        i_e0 = ie0_cand; i_e1 = ie1_cand;
+                        e0 = E0; e1 = E1;
+                        break;
+                    }
+                }
+                if (k_sel < 0) continue;
+            }
 
-            float alpha = 0.0f;
+            float beta = 0.0f;
             float t_val = 0.0f;
             float denom = 0.0f;
-            float dalpha_dxy = 0.0f;
+            float dbeta_dxy = 0.0f;
             bool is_horiz = (dh == 0);
+            float p_center_x = (float)pw + 0.5f;
+            float p_center_y = (float)ph + 0.5f;
 
             if (is_horiz) {
-                int pw_p = dw > 0 ? (int)pw : (int)pw - 1;
-                float fg_center_x = (float)(pw_p == (int)pw ? nw : pw) + 0.5f;
                 float dyv = e1.y - e0.y;
                 denom = dyv;
                 if (fabs(dyv) >= 1e-7f) {
-                    float row_y = (float)ph + 0.5f;
+                    float row_y = p_center_y;
                     float tval = (row_y - e0.y) / dyv;
                     t_val = tval;
                     if (tval >= 0.0f && tval <= 1.0f) {
                         float xe = e0.x + tval * (e1.x - e0.x);
-                        float pl = (float)pw;
-                        float pr = (float)(pw + 1);
-                        float clipped = fmin(fmax(xe, pl), pr);
-                        if (fg_center_x > xe) {
-                            alpha = pr - clipped;
-                            dalpha_dxy = -1.0f;
-                        } else {
-                            alpha = clipped - pl;
-                            dalpha_dxy = 1.0f;
+                        // Check if xe is interior to p's column [pw, pw+1].
+                        if (xe > (float)pw && xe < (float)(pw + 1)) {
+                            // β = smaller of the two cuts = 0.5 - |xe - p_center|.
+                            float d = xe - p_center_x;
+                            beta = 0.5f - fabs(d);
+                            // d_β/d_xe = -sign(d). Pick branch by sign.
+                            dbeta_dxy = (d > 0.0f) ? -1.0f : 1.0f;
                         }
                     }
                 }
             } else {
-                int ph_p = dh > 0 ? (int)ph : (int)ph - 1;
-                float fg_center_y = (float)(ph_p == (int)ph ? nh : ph) + 0.5f;
                 float dxv = e1.x - e0.x;
                 denom = dxv;
                 if (fabs(dxv) >= 1e-7f) {
-                    float col_x = (float)pw + 0.5f;
+                    float col_x = p_center_x;
                     float tval = (col_x - e0.x) / dxv;
                     t_val = tval;
                     if (tval >= 0.0f && tval <= 1.0f) {
                         float ye = e0.y + tval * (e1.y - e0.y);
-                        float pt = (float)ph;
-                        float pb = (float)(ph + 1);
-                        float clipped = fmin(fmax(ye, pt), pb);
-                        if (fg_center_y > ye) {
-                            alpha = pb - clipped;
-                            dalpha_dxy = -1.0f;
-                        } else {
-                            alpha = clipped - pt;
-                            dalpha_dxy = 1.0f;
+                        if (ye > (float)ph && ye < (float)(ph + 1)) {
+                            float d = ye - p_center_y;
+                            beta = 0.5f - fabs(d);
+                            dbeta_dxy = (d > 0.0f) ? -1.0f : 1.0f;
                         }
                     }
                 }
             }
-            alpha = fmin(fmax(alpha, 0.0f), 1.0f);
-            if (alpha <= 0.0f) continue;
+            if (beta <= 0.0f) continue;
 
-            alpha_arr[dir] = alpha;
+            alpha_arr[dir] = beta;
             nbase_arr[dir] = ((pn * (uint)H + (uint)nh) * (uint)W + (uint)nw) * (uint)C;
             active_arr[dir] = true;
-            alpha_sum_local += alpha;
+            alpha_sum_local += beta;
 
             i_e0_arr[dir] = i_e0;
             i_e1_arr[dir] = i_e1;
@@ -272,7 +309,7 @@ extension DiffRast {
             e1x_arr[dir] = e1.x; e1y_arr[dir] = e1.y;
             t_arr[dir] = t_val;
             denom_arr[dir] = denom;
-            dalpha_dxy_arr[dir] = dalpha_dxy;
+            dalpha_dxy_arr[dir] = dbeta_dxy;
             is_horiz_arr[dir] = is_horiz;
         }
     """
