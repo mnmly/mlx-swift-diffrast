@@ -43,11 +43,11 @@ extension DiffRast {
     /// Returns:
     ///   - `out`: `[N, H_img, W_img, C]`.
     ///
-    /// **Differentiability:** w.r.t. `tex` and `uv` in both modes. `d_uvDA`
-    /// (gradient through the LOD chain rule) is currently **zero** in the
-    /// trilinear mode — a deferred follow-up that connects the texture
-    /// gradient back to `pos` through `rast_db`. The bilinear mode has no
-    /// `uvDA` dependence so this restriction doesn't apply.
+    /// **Differentiability:** w.r.t. `tex`, `uv`, and `uvDA` in trilinear
+    /// mode. The `uvDA` gradient flows through the LOD chain rule
+    /// (saturating to zero when LOD is clamped at 0 or `NUM_LEVELS - 1`) —
+    /// which is what connects a texture-aware pixel loss back to `pos`
+    /// through `rast_db` in a full inverse-rendering chain.
     public static func texture(
         _ tex: MLXArray,
         uv: MLXArray,
@@ -182,14 +182,12 @@ extension DiffRast {
                 numLevels: numLevels, boundary: boundaryMode)]
         }
         let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
-            let (dPacked, dUV) = Self.textureTrilinearBackwardKernels(
+            let (dPacked, dUV, dUVDA) = Self.textureTrilinearBackwardKernels(
                 packed: primals[0], uv: primals[1], uvDA: primals[2], dOut: cotangents[0],
                 offsets: offsetsArr, levelH: levelHArr, levelW: levelWArr,
                 packedSize: Int(cumulative),
                 N: N, Himg: Himg, Wimg: Wimg, Htex: Htex, Wtex: Wtex, C: C,
                 numLevels: numLevels, boundary: boundaryMode)
-            // d_uvDA is zero for v1 — full LOD-chain backward is deferred.
-            let dUVDA = MLXArray.zeros(primals[2].shape, dtype: .float32)
             return [dPacked, dUV, dUVDA]
         }
         let custom = CustomFunction { Forward(fwd); VJP(vjp) }
@@ -640,11 +638,120 @@ extension DiffRast {
         d_uv[uv_base + 1] = dfy_sum_total;
     """
 
+    /// d_uvDA: chain rule from `d_out` back through LOD to `(du/dx, du/dy,
+    /// dv/dx, dv/dy)`. Zero when LOD is clamped (saturated at 0 or
+    /// NUM_LEVELS-1), which is the correct derivative of the clamp.
+    ///
+    /// Chain:
+    ///   ∂(out)/∂lod   = sample₁ - sample₀
+    ///   ∂(lod)/∂ρ²    = 1 / (2·ρ²·ln2)
+    ///   ∂(ρ²)/∂A      = [A ≥ B] ;  ∂(ρ²)/∂B = [B > A]
+    ///   ∂(A)/∂(du/dx) = 2·sx·W ;    ∂(A)/∂(dv/dx) = 2·tx·H
+    ///   ∂(B)/∂(du/dy) = 2·sy·W ;    ∂(B)/∂(dv/dy) = 2·ty·H
+    private static let trilinearGradUVDASource = """
+        uint pix = thread_position_in_grid.x;
+        uint total = (uint)N * (uint)Himg * (uint)Wimg;
+        if (pix >= total) return;
+
+        uint pw = pix % (uint)Wimg;
+        uint ph = (pix / (uint)Wimg) % (uint)Himg;
+        uint pn = pix / ((uint)Himg * (uint)Wimg);
+
+        uint uv_base   = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * 2u;
+        uint uvda_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * 4u;
+        uint dout_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * (uint)C;
+
+        float u = uv[uv_base + 0];
+        float v = uv[uv_base + 1];
+
+        float du_dx = uvDA[uvda_base + 0];
+        float du_dy = uvDA[uvda_base + 1];
+        float dv_dx = uvDA[uvda_base + 2];
+        float dv_dy = uvDA[uvda_base + 3];
+        float sx = du_dx * (float)Wtex;
+        float sy = du_dy * (float)Wtex;
+        float tx_ = dv_dx * (float)Htex;
+        float ty_ = dv_dy * (float)Htex;
+        float Asq = sx * sx + tx_ * tx_;
+        float Bsq = sy * sy + ty_ * ty_;
+        float rho_sq = fmax(Asq, Bsq);
+        float lod_raw = 0.5f * log2(fmax(rho_sq, 1e-20f));
+
+        // Saturated → d_uvDA = 0 (correct derivative of clamp at the boundary).
+        if (lod_raw <= 0.0f || lod_raw >= (float)(NUM_LEVELS - 1)) {
+            d_uvDA[uvda_base + 0] = 0.0f;
+            d_uvDA[uvda_base + 1] = 0.0f;
+            d_uvDA[uvda_base + 2] = 0.0f;
+            d_uvDA[uvda_base + 3] = 0.0f;
+            return;
+        }
+
+        int k0 = (int)floor(lod_raw);
+        int k1 = k0 + 1; if (k1 >= NUM_LEVELS) k1 = NUM_LEVELS - 1;
+
+        // d_loss/d_lod = Σ_c d_out[c] · (sample₁[c] - sample₀[c]).
+        float d_lod = 0.0f;
+        for (int level_idx = 0; level_idx < 2; ++level_idx) {
+            int k = (level_idx == 0) ? k0 : k1;
+            float sign = (level_idx == 0) ? -1.0f : 1.0f;
+            int Hk = levelH[k];
+            int Wk = levelW[k];
+            uint level_start = (uint)offsets[k];
+            uint level_n_base = level_start + pn * (uint)Hk * (uint)Wk * (uint)C;
+
+            float tx_real = u * (float)Wk - 0.5f;
+            float ty_real = v * (float)Hk - 0.5f;
+            int tx0i = (int)floor(tx_real);
+            int ty0i = (int)floor(ty_real);
+            int tx1i = tx0i + 1;
+            int ty1i = ty0i + 1;
+            float fx = tx_real - (float)tx0i;
+            float fy = ty_real - (float)ty0i;
+
+            float oob_x0, oob_x1, oob_y0, oob_y1;
+            int ix0 = apply_boundary(tx0i, Wk, BOUNDARY, oob_x0);
+            int ix1 = apply_boundary(tx1i, Wk, BOUNDARY, oob_x1);
+            int iy0 = apply_boundary(ty0i, Hk, BOUNDARY, oob_y0);
+            int iy1 = apply_boundary(ty1i, Hk, BOUNDARY, oob_y1);
+
+            float w00 = (1.0f - fx) * (1.0f - fy) * (1.0f - oob_x0) * (1.0f - oob_y0);
+            float w10 = (       fx) * (1.0f - fy) * (1.0f - oob_x1) * (1.0f - oob_y0);
+            float w01 = (1.0f - fx) * (       fy) * (1.0f - oob_x0) * (1.0f - oob_y1);
+            float w11 = (       fx) * (       fy) * (1.0f - oob_x1) * (1.0f - oob_y1);
+
+            for (int c = 0; c < C; ++c) {
+                float t00 = tex_pyramid[level_n_base + ((uint)iy0 * (uint)Wk + (uint)ix0) * (uint)C + (uint)c];
+                float t10 = tex_pyramid[level_n_base + ((uint)iy0 * (uint)Wk + (uint)ix1) * (uint)C + (uint)c];
+                float t01 = tex_pyramid[level_n_base + ((uint)iy1 * (uint)Wk + (uint)ix0) * (uint)C + (uint)c];
+                float t11 = tex_pyramid[level_n_base + ((uint)iy1 * (uint)Wk + (uint)ix1) * (uint)C + (uint)c];
+                float sample = w00 * t00 + w10 * t10 + w01 * t01 + w11 * t11;
+                d_lod += sign * sample * d_out[dout_base + (uint)c];
+            }
+        }
+
+        // Chain d_lod into uvDA.
+        float ln2 = 0.6931471805599453f;
+        float dlod_drho_sq = 1.0f / (2.0f * rho_sq * ln2);
+        float A_is_max = (Asq >= Bsq) ? 1.0f : 0.0f;
+        float B_is_max = 1.0f - A_is_max;
+
+        d_uvDA[uvda_base + 0] = d_lod * dlod_drho_sq * A_is_max * 2.0f * sx  * (float)Wtex;
+        d_uvDA[uvda_base + 1] = d_lod * dlod_drho_sq * B_is_max * 2.0f * sy  * (float)Wtex;
+        d_uvDA[uvda_base + 2] = d_lod * dlod_drho_sq * A_is_max * 2.0f * tx_ * (float)Htex;
+        d_uvDA[uvda_base + 3] = d_lod * dlod_drho_sq * B_is_max * 2.0f * ty_ * (float)Htex;
+    """
+
     private static let trilinearFwdKernel = MLXFast.metalKernel(
         name: "diffrast_texture_trilinear_fwd",
         inputNames: ["tex_pyramid", "uv", "uvDA", "offsets", "levelH", "levelW"],
         outputNames: ["out"],
         source: trilinearFwdSource, header: boundaryHeader)
+
+    private static let trilinearGradUVDAKernel = MLXFast.metalKernel(
+        name: "diffrast_texture_trilinear_grad_uvda",
+        inputNames: ["tex_pyramid", "uv", "uvDA", "offsets", "levelH", "levelW", "d_out"],
+        outputNames: ["d_uvDA"],
+        source: trilinearGradUVDASource, header: boundaryHeader)
 
     private static let trilinearGradPyramidKernel = MLXFast.metalKernel(
         name: "diffrast_texture_trilinear_grad_pyramid",
@@ -746,7 +853,7 @@ extension DiffRast {
         offsets: MLXArray, levelH: MLXArray, levelW: MLXArray, packedSize: Int,
         N: Int, Himg: Int, Wimg: Int, Htex: Int, Wtex: Int, C: Int,
         numLevels: Int, boundary: BoundaryMode
-    ) -> (MLXArray, MLXArray) {
+    ) -> (MLXArray, MLXArray, MLXArray) {
         let pixels = N * Himg * Wimg
         let rounded = ((pixels + textureTG - 1) / textureTG) * textureTG
         let tmpl = triTmpl(N: N, Himg: Himg, Wimg: Wimg,
@@ -763,6 +870,11 @@ extension DiffRast {
             grid: (rounded, 1, 1), threadGroup: (textureTG, 1, 1),
             outputShapes: [[N, Himg, Wimg, 2]], outputDTypes: [.float32]
         )[0]
-        return (dPacked, dUV)
+        let dUVDA = trilinearGradUVDAKernel(
+            [packed, uv, uvDA, offsets, levelH, levelW, dOut], template: tmpl,
+            grid: (rounded, 1, 1), threadGroup: (textureTG, 1, 1),
+            outputShapes: [[N, Himg, Wimg, 4]], outputDTypes: [.float32]
+        )[0]
+        return (dPacked, dUV, dUVDA)
     }
 }

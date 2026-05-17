@@ -127,10 +127,17 @@ from any given pixel.
 - [x] `d_uv` gradcheck (multi-level sum chain) and `d_tex` gradcheck pass
       against MLX `grad` + finite differences.
 
-#### Deferred
-- [ ] `d_uvDA` (gradient through the LOD chain rule) — currently zero.
-      Connects texture loss back to `pos` through `rast_db` for full
+#### M3.3 — `d_uvDA` (LOD chain backward) (✅ DONE)
+- [x] Chain rule: `∂out/∂lod = sample₁ - sample₀`, `∂lod/∂ρ² = 1/(2ρ²·ln2)`,
+      `∂ρ²/∂A = [A ≥ B]` (and analog for B), `∂A/∂(du/dx) = 2·sx·W` etc.
+- [x] Saturated LOD (clamped at 0 or `NUM_LEVELS - 1`) → `d_uvDA = 0`, which
+      is the analytically correct derivative of the clamp.
+- [x] Gradcheck against MLX `grad` + central FD passes.
+- [x] Closes the texture→pos gradient loop: texture loss now flows back
+      through `uvDA` → `rast_db` → `pos`, completing the full chain for
       texture-aware geometry optimization.
+
+#### Deferred
 - [ ] `mip_level_bias` per-pixel bias parameter.
 - [ ] `filter_mode = .nearest`, `.linearMipmapNearest`, `.nearestMipmapLinear`.
 - [ ] Cube textures + `cube` boundary mode.

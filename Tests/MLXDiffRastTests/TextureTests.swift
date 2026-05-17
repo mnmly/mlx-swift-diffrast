@@ -163,6 +163,10 @@ final class TextureTests: XCTestCase {
         try runTrilinearGradcheck(perturb: .uv)
     }
 
+    func testGradcheckTrilinearUVDA() throws {
+        try runTrilinearGradcheck(perturb: .uvDA)
+    }
+
     private func runTrilinearGradcheck(perturb: PerturbTarget) throws {
         let N = 1, Himg = 2, Wimg = 2, Htex = 4, Wtex = 4, C = 2
 
@@ -193,14 +197,22 @@ final class TextureTests: XCTestCase {
         let loss: (MLXArray) -> MLXArray = { x in
             let out: MLXArray
             switch perturb {
-            case .tex: out = DiffRast.texture(x, uv: uv, uvDA: uvDA,
-                                              filterMode: .linearMipmapLinear)
-            case .uv:  out = DiffRast.texture(tex, uv: x, uvDA: uvDA,
-                                              filterMode: .linearMipmapLinear)
+            case .tex:  out = DiffRast.texture(x, uv: uv, uvDA: uvDA,
+                                               filterMode: .linearMipmapLinear)
+            case .uv:   out = DiffRast.texture(tex, uv: x, uvDA: uvDA,
+                                               filterMode: .linearMipmapLinear)
+            case .uvDA: out = DiffRast.texture(tex, uv: uv, uvDA: x,
+                                               filterMode: .linearMipmapLinear)
             }
             return (out * wOut).sum()
         }
-        let input: MLXArray = (perturb == .tex) ? tex : uv
+        let input: MLXArray = {
+            switch perturb {
+            case .tex:  return tex
+            case .uv:   return uv
+            case .uvDA: return uvDA
+            }
+        }()
 
         let analytic = MLX.grad(loss)(input)
         analytic.eval()
@@ -219,7 +231,7 @@ final class TextureTests: XCTestCase {
         }
     }
 
-    private enum PerturbTarget { case tex, uv }
+    private enum PerturbTarget { case tex, uv, uvDA }
 
     /// Keeps UVs well inside (0, 1) so `floor(tx)` is stable across the eps
     /// perturbation — analogous to the silhouette-edge problem in rasterize.
@@ -250,8 +262,9 @@ final class TextureTests: XCTestCase {
         let loss: (MLXArray) -> MLXArray = { x in
             let out: MLXArray
             switch perturb {
-            case .tex: out = DiffRast.texture(x, uv: uv, boundaryMode: boundary)
-            case .uv:  out = DiffRast.texture(tex, uv: x, boundaryMode: boundary)
+            case .tex:  out = DiffRast.texture(x, uv: uv, boundaryMode: boundary)
+            case .uv:   out = DiffRast.texture(tex, uv: x, boundaryMode: boundary)
+            case .uvDA: fatalError("bilinear path has no uvDA dependence")
             }
             return (out * wOut).sum()
         }
