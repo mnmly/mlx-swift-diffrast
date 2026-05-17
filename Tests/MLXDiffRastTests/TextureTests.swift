@@ -70,6 +70,48 @@ final class TextureTests: XCTestCase {
         XCTAssertEqual(out0.item(Float.self), out1.item(Float.self), accuracy: 1e-5)
     }
 
+    // MARK: - Cube textures
+
+    /// Cube projection picks the correct face from a direction vector.
+    /// We render 6 directions, one per face, with each face filled with a
+    /// distinct constant color and verify the right color comes out.
+    func testCubeFaceSelection() {
+        // tex shape [N=1, 6 faces, H=1, W=1, C=1]. Each face has one texel.
+        let tex = MLXArray([
+            Float(10),  // face 0: +X
+            Float(20),  // face 1: -X
+            Float(30),  // face 2: +Y
+            Float(40),  // face 3: -Y
+            Float(50),  // face 4: +Z
+            Float(60),  // face 5: -Z
+        ], [1, 6, 1, 1, 1])
+        // 6 directions, one per face (with the major axis dominant).
+        let dir = MLXArray([
+            Float( 1), 0, 0,    // +X
+            Float(-1), 0, 0,    // -X
+            Float( 0), 1, 0,    // +Y
+            Float( 0),-1, 0,    // -Y
+            Float( 0), 0, 1,    // +Z
+            Float( 0), 0,-1,    // -Z
+        ], [1, 1, 6, 3])
+        let out = DiffRast.texture(tex, uv: dir, boundaryMode: .cube)
+        XCTAssertEqual(out.shape, [1, 1, 6, 1])
+        let got = out.asArray(Float.self)
+        XCTAssertEqual(got, [10, 20, 30, 40, 50, 60])
+    }
+
+    /// d_tex for cube: scatter to the chosen face's texel only.
+    func testCubeGradientPicksOneFace() {
+        let tex = MLXArray(Array(repeating: Float(0), count: 6), [1, 6, 1, 1, 1])
+        let dir = MLXArray([Float(0), 1, 0], [1, 1, 1, 3])  // +Y → face 2
+        let loss: (MLXArray) -> MLXArray = { t in
+            DiffRast.texture(t, uv: dir, boundaryMode: .cube).sum()
+        }
+        let dT = MLX.grad(loss)(tex).asArray(Float.self)
+        // Only face 2 should receive a gradient = 1.
+        XCTAssertEqual(dT, [0, 0, 1, 0, 0, 0])
+    }
+
     // MARK: - Gradcheck
 
     func testGradcheckTex() throws {

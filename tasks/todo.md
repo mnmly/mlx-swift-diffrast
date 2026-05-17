@@ -164,11 +164,24 @@ from any given pixel.
       nearest mip level (rounded LOD). Cheaper than trilinear; same kernels
       via a `MIP_LINEAR: Bool` template arg.
 
+#### M3.6 — Cube textures (✅ DONE — bilinear, d_dir deferred)
+- [x] `BoundaryMode.cube` — tex shape `[N, 6, H, W, C]`, uv interpreted as
+      a 3D direction vector `[N, H_img, W_img, 3]`.
+- [x] Per-pixel cube projection (OpenGL face order +X,-X,+Y,-Y,+Z,-Z) →
+      face selection + (sc, tc) → (u, v) → bilinear sample on the chosen face.
+- [x] `d_tex` via atomic scatter to the chosen face's four texels.
+- [x] `d_dir` is currently zero — chain rule through the per-face projection
+      is deferred. Cube textures are typically sampled with constant
+      directions (environment lookup) so this doesn't impact common use cases.
+- [ ] Cube + mipmap (only `linear` filter supported with `.cube` today).
+
 #### Deferred
 - [ ] `nearestMipmapNearest` / `nearestMipmapLinear` filter combinations
       (we ship `nearest`, `linear`, `linearMipmapNearest`, `linearMipmapLinear`
       — covers the common cases).
-- [ ] Cube textures + `cube` boundary mode.
+- [ ] Cube + mipmap support for IBL/environment-map workflows.
+- [ ] `d_dir` chain rule for cube textures (needed for surface normal
+      optimization with environment lighting).
 
 Metal-kernel note: template args (e.g. `BOUNDARY`) are NOT visible inside the
 `header:` block — they only resolve in the main kernel body. Helper functions

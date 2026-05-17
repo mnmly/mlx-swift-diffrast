@@ -4,13 +4,16 @@ import MLXFast
 
 extension DiffRast {
 
-    /// Boundary handling for `texture`. Matches the nvdiffrast names for the
-    /// modes that are implemented today.
+    /// Boundary handling for `texture`. Matches the nvdiffrast names.
     public enum BoundaryMode: Int32 {
         case wrap = 0       // tile the texture (periodic)
         case clamp = 1      // edge-extend
         case zero = 2       // sample 0 outside [0, 1] in either axis
-        // .cube is reserved for cube textures (deferred).
+        /// Cube texture mode. `tex` shape must be `[N, 6, H, W, C]` (six
+        /// faces stacked along axis 1), and `uv` is interpreted as a 3D
+        /// direction vector `[N, H_img, W_img, 3]`. Face order: +X, -X, +Y,
+        /// -Y, +Z, -Z (OpenGL convention).
+        case cube = 3
     }
 
     /// Texture filtering mode.
@@ -65,6 +68,19 @@ extension DiffRast {
         mipLevelBias: Float = 0,
         mipLevelBiasMap: MLXArray? = nil
     ) -> MLXArray {
+        // Cube textures dispatch to a dedicated code path — different tex
+        // shape ([N, 6, H, W, C]), uv is a 3D direction vector, and the
+        // sampling math has its own per-face projection.
+        if boundaryMode == .cube {
+            precondition(filterMode == .linear,
+                         "texture: cube textures currently support filterMode .linear only")
+            precondition(tex.ndim == 5 && tex.shape[1] == 6,
+                         "texture: cube tex must be [N, 6, H, W, C] (got \(tex.shape))")
+            precondition(uv.ndim == 4 && uv.shape[3] == 3,
+                         "texture: cube uv must be [N, H_img, W_img, 3] direction vector (got \(uv.shape))")
+            return textureCube(tex, dir: uv)
+        }
+
         precondition(tex.ndim == 4,
                      "texture: tex must be [N, H_tex, W_tex, C] (got \(tex.shape))")
         precondition(uv.ndim == 4 && uv.shape[3] == 2,
@@ -142,6 +158,51 @@ extension DiffRast {
             H = H2; W = W2
         }
         return levels
+    }
+
+    // MARK: - Cube texture path (.cube boundary)
+
+    /// Sample a cube texture given a per-pixel direction vector.
+    /// Cube layout: `tex` shape `[N, 6, H, W, C]` with face order
+    /// `(+X, -X, +Y, -Y, +Z, -Z)` (OpenGL convention).
+    ///
+    /// Differentiable w.r.t. `tex` (atomic scatter into the chosen face).
+    /// `d_dir` is currently zero — the chain rule through the per-face
+    /// projection is deferred; cube textures are typically sampled with
+    /// constant directions (environment lookup) so the missing gradient
+    /// doesn't impact common use cases.
+    private static func textureCube(_ tex: MLXArray, dir: MLXArray) -> MLXArray {
+        let N = dir.shape[0]
+        let Himg = dir.shape[1], Wimg = dir.shape[2]
+        let Htex = tex.shape[2], Wtex = tex.shape[3], C = tex.shape[4]
+
+        // Pack tex as a flat tensor [N * 6 * H * W * C] so the kernel indexes
+        // freely. Broadcast N=1 if needed.
+        var texN = tex
+        if texN.shape[0] == 1 && N > 1 {
+            texN = broadcast(texN, to: [N, 6, Htex, Wtex, C])
+        }
+        let texFlat = texN.reshaped([-1])
+
+        let fwd: ([MLXArray]) -> [MLXArray] = { inputs in
+            [Self.cubeForwardKernel(
+                tex: inputs[0], dir: inputs[1],
+                N: N, Himg: Himg, Wimg: Wimg, Htex: Htex, Wtex: Wtex, C: C)]
+        }
+        let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
+            let dTexFlat = Self.cubeBackwardKernel(
+                tex: primals[0], dir: primals[1], dOut: cotangents[0],
+                N: N, Himg: Himg, Wimg: Wimg, Htex: Htex, Wtex: Wtex, C: C)
+            // d_dir is zero (deferred).
+            let dDir = MLXArray.zeros(primals[1].shape, dtype: .float32)
+            return [dTexFlat, dDir]
+        }
+        let custom = CustomFunction { Forward(fwd); VJP(vjp) }
+        let outFlat = custom([texFlat, dir])[0]
+        // The custom function returns a flat-shaped result if forward returned
+        // one; cubeForwardKernel returns [N, Himg, Wimg, C] directly so this
+        // is fine. Reshape just in case.
+        return outFlat.reshaped([N, Himg, Wimg, C])
     }
 
     // MARK: - Nearest (.nearest) path
@@ -547,6 +608,144 @@ extension DiffRast {
         name: "diffrast_texture_nearest_fwd",
         inputNames: ["tex", "uv"], outputNames: ["out"],
         source: nearestFwdSource, header: boundaryHeader)
+
+    // MARK: - Cube texture kernels
+
+    /// Cube projection from direction (x, y, z) to (face, sc, tc, ma).
+    /// Inlined into both fwd and bwd kernels.
+    private static let cubeProjectionBlock = """
+        float ax = fabs(x), ay = fabs(y), az = fabs(z);
+        int face;
+        float sc, tc, ma;
+        if (ax >= ay && ax >= az) {
+            ma = ax;
+            if (x > 0.0f) { face = 0; sc = -z; tc = -y; }
+            else          { face = 1; sc =  z; tc = -y; }
+        } else if (ay >= az) {
+            ma = ay;
+            if (y > 0.0f) { face = 2; sc =  x; tc =  z; }
+            else          { face = 3; sc =  x; tc = -z; }
+        } else {
+            ma = az;
+            if (z > 0.0f) { face = 4; sc =  x; tc = -y; }
+            else          { face = 5; sc = -x; tc = -y; }
+        }
+        float inv_ma = 1.0f / ma;
+        float u = (sc * inv_ma + 1.0f) * 0.5f;
+        float v = (tc * inv_ma + 1.0f) * 0.5f;
+    """
+
+    private static var cubeFwdSource: String { """
+        uint pix = thread_position_in_grid.x;
+        uint total = (uint)N * (uint)Himg * (uint)Wimg;
+        if (pix >= total) return;
+
+        uint pw = pix % (uint)Wimg;
+        uint ph = (pix / (uint)Wimg) % (uint)Himg;
+        uint pn = pix / ((uint)Himg * (uint)Wimg);
+
+        uint dir_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * 3u;
+        float x = dir[dir_base + 0];
+        float y = dir[dir_base + 1];
+        float z = dir[dir_base + 2];
+
+        \(cubeProjectionBlock)
+
+        // Bilinear sample at chosen face. Clamp boundary handling for the
+        // face edges (cube seams need special handling we skip for v1).
+        float tx_real = u * (float)Wtex - 0.5f;
+        float ty_real = v * (float)Htex - 0.5f;
+        int tx0 = (int)floor(tx_real);
+        int ty0 = (int)floor(ty_real);
+        int tx1 = tx0 + 1;
+        int ty1 = ty0 + 1;
+        float fx = tx_real - (float)tx0;
+        float fy = ty_real - (float)ty0;
+        int ix0 = max(0, min(Wtex - 1, tx0));
+        int ix1 = max(0, min(Wtex - 1, tx1));
+        int iy0 = max(0, min(Htex - 1, ty0));
+        int iy1 = max(0, min(Htex - 1, ty1));
+
+        float w00 = (1.0f - fx) * (1.0f - fy);
+        float w10 =        fx  * (1.0f - fy);
+        float w01 = (1.0f - fx) *        fy;
+        float w11 =        fx  *        fy;
+
+        uint face_base = (pn * 6u + (uint)face) * (uint)Htex * (uint)Wtex * (uint)C;
+        uint out_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * (uint)C;
+
+        for (int c = 0; c < C; ++c) {
+            float t00 = tex[face_base + ((uint)iy0 * (uint)Wtex + (uint)ix0) * (uint)C + (uint)c];
+            float t10 = tex[face_base + ((uint)iy0 * (uint)Wtex + (uint)ix1) * (uint)C + (uint)c];
+            float t01 = tex[face_base + ((uint)iy1 * (uint)Wtex + (uint)ix0) * (uint)C + (uint)c];
+            float t11 = tex[face_base + ((uint)iy1 * (uint)Wtex + (uint)ix1) * (uint)C + (uint)c];
+            out[out_base + (uint)c] = w00 * t00 + w10 * t10 + w01 * t01 + w11 * t11;
+        }
+    """ }
+
+    private static var cubeGradTexSource: String { """
+        uint pix = thread_position_in_grid.x;
+        uint total = (uint)N * (uint)Himg * (uint)Wimg;
+        if (pix >= total) return;
+
+        uint pw = pix % (uint)Wimg;
+        uint ph = (pix / (uint)Wimg) % (uint)Himg;
+        uint pn = pix / ((uint)Himg * (uint)Wimg);
+
+        uint dir_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * 3u;
+        float x = dir[dir_base + 0];
+        float y = dir[dir_base + 1];
+        float z = dir[dir_base + 2];
+
+        \(cubeProjectionBlock)
+
+        float tx_real = u * (float)Wtex - 0.5f;
+        float ty_real = v * (float)Htex - 0.5f;
+        int tx0 = (int)floor(tx_real);
+        int ty0 = (int)floor(ty_real);
+        int tx1 = tx0 + 1;
+        int ty1 = ty0 + 1;
+        float fx = tx_real - (float)tx0;
+        float fy = ty_real - (float)ty0;
+        int ix0 = max(0, min(Wtex - 1, tx0));
+        int ix1 = max(0, min(Wtex - 1, tx1));
+        int iy0 = max(0, min(Htex - 1, ty0));
+        int iy1 = max(0, min(Htex - 1, ty1));
+
+        float w00 = (1.0f - fx) * (1.0f - fy);
+        float w10 =        fx  * (1.0f - fy);
+        float w01 = (1.0f - fx) *        fy;
+        float w11 =        fx  *        fy;
+
+        uint face_base = (pn * 6u + (uint)face) * (uint)Htex * (uint)Wtex * (uint)C;
+        uint dout_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * (uint)C;
+
+        for (int c = 0; c < C; ++c) {
+            float g = d_out[dout_base + (uint)c];
+            atomic_fetch_add_explicit(
+                &d_tex[face_base + ((uint)iy0 * (uint)Wtex + (uint)ix0) * (uint)C + (uint)c],
+                w00 * g, memory_order_relaxed);
+            atomic_fetch_add_explicit(
+                &d_tex[face_base + ((uint)iy0 * (uint)Wtex + (uint)ix1) * (uint)C + (uint)c],
+                w10 * g, memory_order_relaxed);
+            atomic_fetch_add_explicit(
+                &d_tex[face_base + ((uint)iy1 * (uint)Wtex + (uint)ix0) * (uint)C + (uint)c],
+                w01 * g, memory_order_relaxed);
+            atomic_fetch_add_explicit(
+                &d_tex[face_base + ((uint)iy1 * (uint)Wtex + (uint)ix1) * (uint)C + (uint)c],
+                w11 * g, memory_order_relaxed);
+        }
+    """ }
+
+    private static let cubeFwdKernel = MLXFast.metalKernel(
+        name: "diffrast_texture_cube_fwd",
+        inputNames: ["tex", "dir"], outputNames: ["out"],
+        source: cubeFwdSource)
+
+    private static let cubeGradTexKernel = MLXFast.metalKernel(
+        name: "diffrast_texture_cube_grad_tex",
+        inputNames: ["tex", "dir", "d_out"], outputNames: ["d_tex"],
+        source: cubeGradTexSource, atomicOutputs: true)
 
     private static let nearestGradTexKernel = MLXFast.metalKernel(
         name: "diffrast_texture_nearest_grad_tex",
@@ -954,6 +1153,39 @@ extension DiffRast {
             threadGroup: (textureTG, 1, 1),
             outputShapes: [[N, Himg, Wimg, C]],
             outputDTypes: [.float32]
+        )[0]
+    }
+
+    private static func cubeForwardKernel(
+        tex: MLXArray, dir: MLXArray,
+        N: Int, Himg: Int, Wimg: Int, Htex: Int, Wtex: Int, C: Int
+    ) -> MLXArray {
+        let pixels = N * Himg * Wimg
+        let rounded = ((pixels + textureTG - 1) / textureTG) * textureTG
+        return cubeFwdKernel(
+            [tex, dir],
+            template: [("N", N), ("Himg", Himg), ("Wimg", Wimg),
+                       ("Htex", Htex), ("Wtex", Wtex), ("C", C)],
+            grid: (rounded, 1, 1), threadGroup: (textureTG, 1, 1),
+            outputShapes: [[N, Himg, Wimg, C]],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
+    private static func cubeBackwardKernel(
+        tex: MLXArray, dir: MLXArray, dOut: MLXArray,
+        N: Int, Himg: Int, Wimg: Int, Htex: Int, Wtex: Int, C: Int
+    ) -> MLXArray {
+        let pixels = N * Himg * Wimg
+        let rounded = ((pixels + textureTG - 1) / textureTG) * textureTG
+        return cubeGradTexKernel(
+            [tex, dir, dOut],
+            template: [("N", N), ("Himg", Himg), ("Wimg", Wimg),
+                       ("Htex", Htex), ("Wtex", Wtex), ("C", C)],
+            grid: (rounded, 1, 1), threadGroup: (textureTG, 1, 1),
+            outputShapes: [[N * 6 * Htex * Wtex * C]],
+            outputDTypes: [.float32],
+            initValue: 0.0
         )[0]
     }
 
