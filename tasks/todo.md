@@ -145,10 +145,18 @@ from any given pixel.
       `uvDA · 2^bias` in Swift before kernel dispatch, so the existing kernels
       and `d_uvDA` chain rule work unchanged.
 
+#### M3.5 — Per-pixel mip bias + linearMipmapNearest (✅ DONE)
+- [x] `mipLevelBiasMap: MLXArray?` parameter — per-pixel bias `[N, H, W]` or
+      `[N, H, W, 1]`. Folded into `uvDA` as `uvDA · 2^map` in Swift; the
+      existing kernels and `d_uvDA` chain rule work unchanged.
+- [x] `FilterMode.linearMipmapNearest` — bilinear sample at the *single*
+      nearest mip level (rounded LOD). Cheaper than trilinear; same kernels
+      via a `MIP_LINEAR: Bool` template arg.
+
 #### Deferred
-- [ ] Per-pixel `mip_level_bias` (currently scalar only).
-- [ ] `nearestMipmapNearest` / `linearMipmapNearest` / `nearestMipmapLinear`
-      filter combinations (we only ship `nearest`, `linear`, `linearMipmapLinear`).
+- [ ] `nearestMipmapNearest` / `nearestMipmapLinear` filter combinations
+      (we ship `nearest`, `linear`, `linearMipmapNearest`, `linearMipmapLinear`
+      — covers the common cases).
 - [ ] Cube textures + `cube` boundary mode.
 
 Metal-kernel note: template args (e.g. `BOUNDARY`) are NOT visible inside the

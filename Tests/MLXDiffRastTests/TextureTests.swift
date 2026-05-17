@@ -203,6 +203,53 @@ final class TextureTests: XCTestCase {
 
     // MARK: - mipLevelBias
 
+    /// `linearMipmapNearest`: sample at a single (nearest) mip level, no
+    /// blending. Should match trilinear at a LOD that's exactly an integer,
+    /// since trilinear's `frac` is zero there.
+    func testMipmapNearestMatchesTrilinearAtIntegerLOD() {
+        let tex = MLXArray((0..<32).map { Float($0) * 0.05 }, [1, 4, 4, 2])
+        let uv = MLXArray([Float(0.42), 0.31], [1, 1, 1, 2])
+        // Pick uvDA so that LOD = exactly 1: rho_sq = 4 → log2(4)/2 = 1.
+        // sx = du_dx * Wtex = 4 → du_dx = 1; pick the others to keep rho²=4.
+        let uvDA = MLXArray([Float(0.5), 0.0, 0.0, 0.5], [1, 1, 1, 4])
+
+        let triOut = DiffRast.texture(tex, uv: uv, uvDA: uvDA,
+                                       filterMode: .linearMipmapLinear)
+        let nrOut = DiffRast.texture(tex, uv: uv, uvDA: uvDA,
+                                      filterMode: .linearMipmapNearest)
+        let t = triOut.asArray(Float.self)
+        let n = nrOut.asArray(Float.self)
+        for i in 0..<t.count {
+            XCTAssertEqual(t[i], n[i], accuracy: 1e-5,
+                           "channel \(i): trilinear \(t[i]) vs mipmap-nearest \(n[i])")
+        }
+    }
+
+    /// Per-pixel `mipLevelBiasMap` should be equivalent to scaling uvDA per
+    /// pixel by 2^map.
+    func testPerPixelMipLevelBiasMatchesScaledUVDA() {
+        let tex = MLXArray((0..<32).map { Float($0) * 0.05 }, [1, 4, 4, 2])
+        let uv = MLXArray((0..<4).map { _ in [Float(0.42), 0.31] }.flatMap { $0 },
+                          [1, 2, 2, 2])
+        let uvDA = MLXArray((0..<4).map { _ in [Float(0.3), 0.1, 0.1, 0.3] }.flatMap { $0 },
+                            [1, 2, 2, 4])
+        let biasMap = MLXArray([Float(0.5), -0.3, 1.0, -1.0], [1, 2, 2])
+
+        let outBiased = DiffRast.texture(tex, uv: uv, uvDA: uvDA,
+                                         filterMode: .linearMipmapLinear,
+                                         mipLevelBiasMap: biasMap)
+        // Equivalent scaling.
+        let scale = pow(MLXArray(Float(2.0)), biasMap).expandedDimensions(axis: 3)
+        let outScaled = DiffRast.texture(tex, uv: uv, uvDA: uvDA * scale,
+                                         filterMode: .linearMipmapLinear)
+        let b = outBiased.asArray(Float.self)
+        let s = outScaled.asArray(Float.self)
+        for i in 0..<b.count {
+            XCTAssertEqual(b[i], s[i], accuracy: 1e-5,
+                           "elem \(i): biasMap \(b[i]) vs scaled-uvDA \(s[i])")
+        }
+    }
+
     /// `mipLevelBias` scales `uvDA` by 2^bias before the LOD computation. So
     /// rendering with `bias = +log₂(k)` should be equivalent to rendering
     /// with `uvDA · k`.

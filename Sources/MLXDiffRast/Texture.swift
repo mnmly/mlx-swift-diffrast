@@ -21,6 +21,10 @@ extension DiffRast {
     ///   pixel-art textures or exact integer-indexed lookups.
     /// - `linear`: bilinear sampling at the source resolution. Fast and
     ///   robust when sampling at ~source scale; aliases under minification.
+    /// - `linearMipmapNearest`: bilinear sample at the *single* nearest mip
+    ///   level (rounded from LOD). Cheaper than trilinear and good enough
+    ///   when mip-level boundaries don't show as visible banding in the
+    ///   target use case.
     /// - `linearMipmapLinear`: classic trilinear filtering. Builds a 2× box-
     ///   filter mip pyramid, derives a per-pixel LOD from `uvDA`, then blends
     ///   bilinear samples from the two adjacent mip levels. Stable under wide
@@ -28,6 +32,7 @@ extension DiffRast {
     public enum FilterMode {
         case nearest
         case linear
+        case linearMipmapNearest
         case linearMipmapLinear
     }
 
@@ -57,7 +62,8 @@ extension DiffRast {
         uvDA: MLXArray? = nil,
         filterMode: FilterMode = .linear,
         boundaryMode: BoundaryMode = .wrap,
-        mipLevelBias: Float = 0
+        mipLevelBias: Float = 0,
+        mipLevelBiasMap: MLXArray? = nil
     ) -> MLXArray {
         precondition(tex.ndim == 4,
                      "texture: tex must be [N, H_tex, W_tex, C] (got \(tex.shape))")
@@ -71,23 +77,40 @@ extension DiffRast {
             return textureNearest(tex, uv: uv, boundaryMode: boundaryMode)
         case .linear:
             return textureBilinear(tex, uv: uv, boundaryMode: boundaryMode)
-        case .linearMipmapLinear:
+        case .linearMipmapNearest, .linearMipmapLinear:
             precondition(uvDA != nil,
-                         "texture: filterMode .linearMipmapLinear requires uvDA")
+                         "texture: mipmap filterModes require uvDA")
             precondition(uvDA!.shape[0] == uv.shape[0]
                          && uvDA!.shape[1] == uv.shape[1]
                          && uvDA!.shape[2] == uv.shape[2]
                          && uvDA!.shape[3] == 4,
                          "texture: uvDA must be [N, H_img, W_img, 4] (got \(uvDA!.shape))")
-            // mipLevelBias = b is folded into uvDA by multiplying by 2^b:
-            //   lod = 0.5·log₂(ρ²·2^(2b)) = 0.5·log₂(ρ²) + b.
-            // This avoids changing all four trilinear kernels and keeps
-            // gradient flow through MLX autograd (the multiply is a regular
-            // op, so its backward folds into d_uvDA correctly).
-            let scale: Float = pow(2.0, mipLevelBias)
-            let effectiveUVDA: MLXArray = (mipLevelBias == 0) ? uvDA! : (uvDA! * scale)
-            return textureTrilinear(tex, uv: uv, uvDA: effectiveUVDA,
-                                    boundaryMode: boundaryMode)
+            // mipLevelBias and mipLevelBiasMap are folded into uvDA by
+            // multiplying by 2^bias — `lod = 0.5·log₂(ρ²·2^(2b)) = 0.5·log₂(ρ²) + b`.
+            // Per-pixel: bias map is `[N, H, W]` or `[N, H, W, 1]`, broadcast
+            // over the 4 uvDA channels. Gradient flows correctly through MLX
+            // autograd (the multiply is a regular op).
+            let effectiveUVDA: MLXArray
+            if let map = mipLevelBiasMap {
+                precondition(map.shape[0] == uv.shape[0]
+                             && map.shape[1] == uv.shape[1]
+                             && map.shape[2] == uv.shape[2],
+                             "texture: mipLevelBiasMap must be [N, H_img, W_img] or [N, H_img, W_img, 1] (got \(map.shape))")
+                let mapExpanded = (map.ndim == 3) ? map.expandedDimensions(axis: 3) : map
+                let scale = pow(MLXArray(Float(2.0)), mapExpanded)
+                // Combine scalar mipLevelBias with per-pixel map.
+                let scaleWithScalar = (mipLevelBias == 0)
+                    ? scale
+                    : scale * MLXArray(pow(2.0, mipLevelBias))
+                effectiveUVDA = uvDA! * scaleWithScalar
+            } else if mipLevelBias != 0 {
+                effectiveUVDA = uvDA! * MLXArray(pow(2.0, mipLevelBias))
+            } else {
+                effectiveUVDA = uvDA!
+            }
+            let mipLinear = (filterMode == .linearMipmapLinear)
+            return textureMipmap(tex, uv: uv, uvDA: effectiveUVDA,
+                                 boundaryMode: boundaryMode, mipLinear: mipLinear)
         }
     }
 
@@ -185,10 +208,11 @@ extension DiffRast {
         return custom([texN, uv])[0]
     }
 
-    // MARK: - Trilinear (.linearMipmapLinear) path
+    // MARK: - Mipmap path (.linearMipmapLinear and .linearMipmapNearest)
 
-    private static func textureTrilinear(
-        _ tex: MLXArray, uv: MLXArray, uvDA: MLXArray, boundaryMode: BoundaryMode
+    private static func textureMipmap(
+        _ tex: MLXArray, uv: MLXArray, uvDA: MLXArray,
+        boundaryMode: BoundaryMode, mipLinear: Bool
     ) -> MLXArray {
         let N = uv.shape[0]
         let Himg = uv.shape[1], Wimg = uv.shape[2]
@@ -226,7 +250,7 @@ extension DiffRast {
                 packed: inputs[0], uv: inputs[1], uvDA: inputs[2],
                 offsets: offsetsArr, levelH: levelHArr, levelW: levelWArr,
                 N: N, Himg: Himg, Wimg: Wimg, Htex: Htex, Wtex: Wtex, C: C,
-                numLevels: numLevels, boundary: boundaryMode)]
+                numLevels: numLevels, boundary: boundaryMode, mipLinear: mipLinear)]
         }
         let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
             let (dPacked, dUV, dUVDA) = Self.textureTrilinearBackwardKernels(
@@ -234,7 +258,7 @@ extension DiffRast {
                 offsets: offsetsArr, levelH: levelHArr, levelW: levelWArr,
                 packedSize: Int(cumulative),
                 N: N, Himg: Himg, Wimg: Wimg, Htex: Htex, Wtex: Wtex, C: C,
-                numLevels: numLevels, boundary: boundaryMode)
+                numLevels: numLevels, boundary: boundaryMode, mipLinear: mipLinear)
             return [dPacked, dUV, dUVDA]
         }
         let custom = CustomFunction { Forward(fwd); VJP(vjp) }
@@ -535,6 +559,9 @@ extension DiffRast {
     /// Per-pixel LOD + bilinear sample at level k, packed-pyramid form.
     /// Shared between forward and backward bodies via Swift string interpolation
     /// (see [[feedback-mlxfast-kernel-sharing]] for why not header functions).
+    ///
+    /// Honors `MIP_LINEAR` template arg: `1` = trilinear (floor + frac blend
+    /// of two adjacent levels), `0` = mipmap-nearest (round, single level).
     private static let trilinearBilinearBlock = """
         // Compute LOD from uvDA. Reference scale is the level-0 dimensions.
         float du_dx = uvDA[uvda_base + 0];
@@ -548,9 +575,19 @@ extension DiffRast {
         float rho_sq = fmax(sx * sx + tx * tx, sy * sy + ty * ty);
         float lod = 0.5f * log2(fmax(rho_sq, 1e-20f));
         lod = fmax(0.0f, fmin((float)(NUM_LEVELS - 1), lod));
-        int k0 = (int)floor(lod);
-        int k1 = k0 + 1; if (k1 >= NUM_LEVELS) k1 = NUM_LEVELS - 1;
-        float frac = lod - (float)k0;
+        int k0, k1;
+        float frac;
+        if (MIP_LINEAR) {
+            k0 = (int)floor(lod);
+            k1 = k0 + 1; if (k1 >= NUM_LEVELS) k1 = NUM_LEVELS - 1;
+            frac = lod - (float)k0;
+        } else {
+            // Nearest mip level: round to nearest integer, single sample.
+            k0 = (int)floor(lod + 0.5f);
+            if (k0 >= NUM_LEVELS) k0 = NUM_LEVELS - 1;
+            k1 = k0;
+            frac = 0.0f;
+        }
     """
 
     /// `BILINEAR_AT_LEVEL_BLOCK(k_var, weights_out, indices_out)` is too messy
@@ -982,19 +1019,20 @@ extension DiffRast {
 
     private static func triTmpl(
         N: Int, Himg: Int, Wimg: Int, Htex: Int, Wtex: Int, C: Int,
-        numLevels: Int, boundary: BoundaryMode
+        numLevels: Int, boundary: BoundaryMode, mipLinear: Bool
     ) -> [(String, any KernelTemplateArg)] {
         [("N", N), ("Himg", Himg), ("Wimg", Wimg),
          ("Htex", Htex), ("Wtex", Wtex), ("C", C),
          ("NUM_LEVELS", numLevels),
-         ("BOUNDARY", Int(boundary.rawValue))]
+         ("BOUNDARY", Int(boundary.rawValue)),
+         ("MIP_LINEAR", mipLinear)]
     }
 
     private static func textureTrilinearForwardKernel(
         packed: MLXArray, uv: MLXArray, uvDA: MLXArray,
         offsets: MLXArray, levelH: MLXArray, levelW: MLXArray,
         N: Int, Himg: Int, Wimg: Int, Htex: Int, Wtex: Int, C: Int,
-        numLevels: Int, boundary: BoundaryMode
+        numLevels: Int, boundary: BoundaryMode, mipLinear: Bool
     ) -> MLXArray {
         let pixels = N * Himg * Wimg
         let rounded = ((pixels + textureTG - 1) / textureTG) * textureTG
@@ -1002,7 +1040,8 @@ extension DiffRast {
             [packed, uv, uvDA, offsets, levelH, levelW],
             template: triTmpl(N: N, Himg: Himg, Wimg: Wimg,
                               Htex: Htex, Wtex: Wtex, C: C,
-                              numLevels: numLevels, boundary: boundary),
+                              numLevels: numLevels, boundary: boundary,
+                              mipLinear: mipLinear),
             grid: (rounded, 1, 1), threadGroup: (textureTG, 1, 1),
             outputShapes: [[N, Himg, Wimg, C]],
             outputDTypes: [.float32]
@@ -1013,13 +1052,14 @@ extension DiffRast {
         packed: MLXArray, uv: MLXArray, uvDA: MLXArray, dOut: MLXArray,
         offsets: MLXArray, levelH: MLXArray, levelW: MLXArray, packedSize: Int,
         N: Int, Himg: Int, Wimg: Int, Htex: Int, Wtex: Int, C: Int,
-        numLevels: Int, boundary: BoundaryMode
+        numLevels: Int, boundary: BoundaryMode, mipLinear: Bool
     ) -> (MLXArray, MLXArray, MLXArray) {
         let pixels = N * Himg * Wimg
         let rounded = ((pixels + textureTG - 1) / textureTG) * textureTG
         let tmpl = triTmpl(N: N, Himg: Himg, Wimg: Wimg,
                            Htex: Htex, Wtex: Wtex, C: C,
-                           numLevels: numLevels, boundary: boundary)
+                           numLevels: numLevels, boundary: boundary,
+                           mipLinear: mipLinear)
         let dPacked = trilinearGradPyramidKernel(
             [packed, uv, uvDA, offsets, levelH, levelW, dOut], template: tmpl,
             grid: (rounded, 1, 1), threadGroup: (textureTG, 1, 1),
