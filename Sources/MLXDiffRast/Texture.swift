@@ -15,15 +15,18 @@ extension DiffRast {
 
     /// Texture filtering mode.
     ///
-    /// - `linear`: bilinear sampling at the source resolution (no mipmap).
-    ///   Fast and robust when the texture is sampled at roughly its source
-    ///   scale, but aliases badly when the screen-space footprint of a texel
-    ///   shrinks (minification).
+    /// - `nearest`: single closest texel from level 0. Cheapest and exact
+    ///   (no interpolation aliasing) but discontinuous in `uv` — gradient
+    ///   w.r.t. `uv` is zero (the lookup is piecewise constant). Use for
+    ///   pixel-art textures or exact integer-indexed lookups.
+    /// - `linear`: bilinear sampling at the source resolution. Fast and
+    ///   robust when sampling at ~source scale; aliases under minification.
     /// - `linearMipmapLinear`: classic trilinear filtering. Builds a 2× box-
     ///   filter mip pyramid, derives a per-pixel LOD from `uvDA`, then blends
     ///   bilinear samples from the two adjacent mip levels. Stable under wide
     ///   scale variation, costs an extra log-depth pyramid build.
     public enum FilterMode {
+        case nearest
         case linear
         case linearMipmapLinear
     }
@@ -53,7 +56,8 @@ extension DiffRast {
         uv: MLXArray,
         uvDA: MLXArray? = nil,
         filterMode: FilterMode = .linear,
-        boundaryMode: BoundaryMode = .wrap
+        boundaryMode: BoundaryMode = .wrap,
+        mipLevelBias: Float = 0
     ) -> MLXArray {
         precondition(tex.ndim == 4,
                      "texture: tex must be [N, H_tex, W_tex, C] (got \(tex.shape))")
@@ -63,6 +67,8 @@ extension DiffRast {
                      "texture: tex batch dim \(tex.shape[0]) incompatible with uv batch \(uv.shape[0])")
 
         switch filterMode {
+        case .nearest:
+            return textureNearest(tex, uv: uv, boundaryMode: boundaryMode)
         case .linear:
             return textureBilinear(tex, uv: uv, boundaryMode: boundaryMode)
         case .linearMipmapLinear:
@@ -73,7 +79,15 @@ extension DiffRast {
                          && uvDA!.shape[2] == uv.shape[2]
                          && uvDA!.shape[3] == 4,
                          "texture: uvDA must be [N, H_img, W_img, 4] (got \(uvDA!.shape))")
-            return textureTrilinear(tex, uv: uv, uvDA: uvDA!, boundaryMode: boundaryMode)
+            // mipLevelBias = b is folded into uvDA by multiplying by 2^b:
+            //   lod = 0.5·log₂(ρ²·2^(2b)) = 0.5·log₂(ρ²) + b.
+            // This avoids changing all four trilinear kernels and keeps
+            // gradient flow through MLX autograd (the multiply is a regular
+            // op, so its backward folds into d_uvDA correctly).
+            let scale: Float = pow(2.0, mipLevelBias)
+            let effectiveUVDA: MLXArray = (mipLevelBias == 0) ? uvDA! : (uvDA! * scale)
+            return textureTrilinear(tex, uv: uv, uvDA: effectiveUVDA,
+                                    boundaryMode: boundaryMode)
         }
     }
 
@@ -105,6 +119,39 @@ extension DiffRast {
             H = H2; W = W2
         }
         return levels
+    }
+
+    // MARK: - Nearest (.nearest) path
+
+    private static func textureNearest(
+        _ tex: MLXArray, uv: MLXArray, boundaryMode: BoundaryMode
+    ) -> MLXArray {
+        let N = uv.shape[0]
+        let Himg = uv.shape[1], Wimg = uv.shape[2]
+        let Htex = tex.shape[1], Wtex = tex.shape[2], C = tex.shape[3]
+
+        var texN = tex
+        if texN.shape[0] == 1 && N > 1 {
+            texN = broadcast(texN, to: [N, Htex, Wtex, C])
+        }
+
+        let fwd: ([MLXArray]) -> [MLXArray] = { inputs in
+            [Self.textureNearestForwardKernel(
+                tex: inputs[0], uv: inputs[1],
+                N: N, Himg: Himg, Wimg: Wimg, Htex: Htex, Wtex: Wtex, C: C,
+                boundary: boundaryMode)]
+        }
+        // uv has no gradient (nearest is piecewise constant); only d_tex flows.
+        let vjp: ([MLXArray], [MLXArray]) -> [MLXArray] = { primals, cotangents in
+            let dTex = Self.textureNearestBackwardKernel(
+                tex: primals[0], uv: primals[1], dOut: cotangents[0],
+                N: N, Himg: Himg, Wimg: Wimg, Htex: Htex, Wtex: Wtex, C: C,
+                boundary: boundaryMode)
+            let dUV = MLXArray.zeros(primals[1].shape, dtype: .float32)
+            return [dTex, dUV]
+        }
+        let custom = CustomFunction { Forward(fwd); VJP(vjp) }
+        return custom([texN, uv])[0]
     }
 
     // MARK: - Bilinear (.linear) path — original M3.1 implementation
@@ -405,6 +452,83 @@ extension DiffRast {
         name: "diffrast_texture_grad_uv",
         inputNames: ["tex", "uv", "d_out"], outputNames: ["d_uv"],
         source: gradUVSource, header: boundaryHeader)
+
+    // MARK: - Nearest filter kernels
+
+    /// Single-texel lookup. Texel index = `floor(uv * tex_size)`. Out-of-bounds
+    /// behavior follows `BoundaryMode` (with `.zero` → output is zero on OOB).
+    private static let nearestFwdSource = """
+        uint pix = thread_position_in_grid.x;
+        uint total = (uint)N * (uint)Himg * (uint)Wimg;
+        if (pix >= total) return;
+
+        uint pw = pix % (uint)Wimg;
+        uint ph = (pix / (uint)Wimg) % (uint)Himg;
+        uint pn = pix / ((uint)Himg * (uint)Wimg);
+
+        uint uv_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * 2u;
+        float u = uv[uv_base + 0];
+        float v = uv[uv_base + 1];
+
+        int tx = (int)floor(u * (float)Wtex);
+        int ty = (int)floor(v * (float)Htex);
+
+        float oob_x, oob_y;
+        int ix = apply_boundary(tx, Wtex, BOUNDARY, oob_x);
+        int iy = apply_boundary(ty, Htex, BOUNDARY, oob_y);
+        float mask = (1.0f - oob_x) * (1.0f - oob_y);
+
+        uint tex_n_base = pn * (uint)Htex * (uint)Wtex * (uint)C;
+        uint out_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * (uint)C;
+        for (int c = 0; c < C; ++c) {
+            float t = tex[tex_n_base + ((uint)iy * (uint)Wtex + (uint)ix) * (uint)C + (uint)c];
+            out[out_base + (uint)c] = t * mask;
+        }
+    """
+
+    /// d_tex for nearest: atomic-add `d_out * mask` into the single chosen texel.
+    /// d_uv has no contribution (nearest is piecewise constant in uv).
+    private static let nearestGradTexSource = """
+        uint pix = thread_position_in_grid.x;
+        uint total = (uint)N * (uint)Himg * (uint)Wimg;
+        if (pix >= total) return;
+
+        uint pw = pix % (uint)Wimg;
+        uint ph = (pix / (uint)Wimg) % (uint)Himg;
+        uint pn = pix / ((uint)Himg * (uint)Wimg);
+
+        uint uv_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * 2u;
+        float u = uv[uv_base + 0];
+        float v = uv[uv_base + 1];
+
+        int tx = (int)floor(u * (float)Wtex);
+        int ty = (int)floor(v * (float)Htex);
+
+        float oob_x, oob_y;
+        int ix = apply_boundary(tx, Wtex, BOUNDARY, oob_x);
+        int iy = apply_boundary(ty, Htex, BOUNDARY, oob_y);
+        float mask = (1.0f - oob_x) * (1.0f - oob_y);
+
+        uint dout_base = ((pn * (uint)Himg + ph) * (uint)Wimg + pw) * (uint)C;
+        uint dtex_n_base = pn * (uint)Htex * (uint)Wtex * (uint)C;
+        for (int c = 0; c < C; ++c) {
+            float g = d_out[dout_base + (uint)c] * mask;
+            atomic_fetch_add_explicit(
+                &d_tex[dtex_n_base + ((uint)iy * (uint)Wtex + (uint)ix) * (uint)C + (uint)c],
+                g, memory_order_relaxed);
+        }
+    """
+
+    private static let nearestFwdKernel = MLXFast.metalKernel(
+        name: "diffrast_texture_nearest_fwd",
+        inputNames: ["tex", "uv"], outputNames: ["out"],
+        source: nearestFwdSource, header: boundaryHeader)
+
+    private static let nearestGradTexKernel = MLXFast.metalKernel(
+        name: "diffrast_texture_nearest_grad_tex",
+        inputNames: ["tex", "uv", "d_out"], outputNames: ["d_tex"],
+        source: nearestGradTexSource, header: boundaryHeader,
+        atomicOutputs: true)
 
     // MARK: - Trilinear kernels (mipmap + LOD)
 
@@ -793,6 +917,43 @@ extension DiffRast {
             threadGroup: (textureTG, 1, 1),
             outputShapes: [[N, Himg, Wimg, C]],
             outputDTypes: [.float32]
+        )[0]
+    }
+
+    private static func textureNearestForwardKernel(
+        tex: MLXArray, uv: MLXArray,
+        N: Int, Himg: Int, Wimg: Int, Htex: Int, Wtex: Int, C: Int,
+        boundary: BoundaryMode
+    ) -> MLXArray {
+        let pixels = N * Himg * Wimg
+        let rounded = ((pixels + textureTG - 1) / textureTG) * textureTG
+        return nearestFwdKernel(
+            [tex, uv],
+            template: texTmpl(N: N, Himg: Himg, Wimg: Wimg,
+                              Htex: Htex, Wtex: Wtex, C: C, boundary: boundary),
+            grid: (rounded, 1, 1),
+            threadGroup: (textureTG, 1, 1),
+            outputShapes: [[N, Himg, Wimg, C]],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
+    private static func textureNearestBackwardKernel(
+        tex: MLXArray, uv: MLXArray, dOut: MLXArray,
+        N: Int, Himg: Int, Wimg: Int, Htex: Int, Wtex: Int, C: Int,
+        boundary: BoundaryMode
+    ) -> MLXArray {
+        let pixels = N * Himg * Wimg
+        let rounded = ((pixels + textureTG - 1) / textureTG) * textureTG
+        return nearestGradTexKernel(
+            [tex, uv, dOut],
+            template: texTmpl(N: N, Himg: Himg, Wimg: Wimg,
+                              Htex: Htex, Wtex: Wtex, C: C, boundary: boundary),
+            grid: (rounded, 1, 1),
+            threadGroup: (textureTG, 1, 1),
+            outputShapes: [[N, Htex, Wtex, C]],
+            outputDTypes: [.float32],
+            initValue: 0.0
         )[0]
     }
 

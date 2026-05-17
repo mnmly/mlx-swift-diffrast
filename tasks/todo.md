@@ -137,9 +137,18 @@ from any given pixel.
       through `uvDA` → `rast_db` → `pos`, completing the full chain for
       texture-aware geometry optimization.
 
+#### M3.4 — Small texture features (✅ DONE)
+- [x] `FilterMode.nearest` — single-texel lookup; cheapest forward, no
+      interpolation aliasing. `d_uv` is zero (lookup is piecewise constant);
+      `d_tex` is atomic scatter into the chosen texel.
+- [x] `mipLevelBias: Float` parameter for trilinear — folded into `uvDA` as
+      `uvDA · 2^bias` in Swift before kernel dispatch, so the existing kernels
+      and `d_uvDA` chain rule work unchanged.
+
 #### Deferred
-- [ ] `mip_level_bias` per-pixel bias parameter.
-- [ ] `filter_mode = .nearest`, `.linearMipmapNearest`, `.nearestMipmapLinear`.
+- [ ] Per-pixel `mip_level_bias` (currently scalar only).
+- [ ] `nearestMipmapNearest` / `linearMipmapNearest` / `nearestMipmapLinear`
+      filter combinations (we only ship `nearest`, `linear`, `linearMipmapLinear`).
 - [ ] Cube textures + `cube` boundary mode.
 
 Metal-kernel note: template args (e.g. `BOUNDARY`) are NOT visible inside the

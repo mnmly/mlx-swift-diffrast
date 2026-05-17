@@ -167,6 +167,64 @@ final class TextureTests: XCTestCase {
         try runTrilinearGradcheck(perturb: .uvDA)
     }
 
+    // MARK: - Nearest filter
+
+    /// Nearest filter at a texel-interior UV returns that texel exactly.
+    func testNearestExactTexelLookup() {
+        let tex = MLXArray([
+            Float(10), 20,
+            Float(30), 40,
+        ], [1, 2, 2, 1])
+        // u=0.3 → tx = floor(0.3 * 2) = 0; v=0.7 → ty = floor(0.7*2) = 1.
+        // tex[1, 0] = 30.
+        let uv = MLXArray([Float(0.3), 0.7], [1, 1, 1, 2])
+        let out = DiffRast.texture(tex, uv: uv, filterMode: .nearest)
+        XCTAssertEqual(out.item(Float.self), 30, accuracy: 1e-6)
+    }
+
+    /// Nearest gradient: only d_tex flows; d_uv is zero (piecewise constant).
+    func testNearestGradient() {
+        let tex = MLXArray([Float(10), 20, 30, 40], [1, 2, 2, 1])
+        let uv = MLXArray([Float(0.3), 0.7], [1, 1, 1, 2])
+
+        let lossT: (MLXArray) -> MLXArray = { t in
+            DiffRast.texture(t, uv: uv, filterMode: .nearest).sum()
+        }
+        let dT = MLX.grad(lossT)(tex).asArray(Float.self)
+        // The chosen texel is (1, 0) of [2, 2] in [H, W] order → index 2 in flat.
+        XCTAssertEqual(dT, [0, 0, 1, 0])
+
+        let lossU: (MLXArray) -> MLXArray = { u in
+            DiffRast.texture(tex, uv: u, filterMode: .nearest).sum()
+        }
+        let dU = MLX.grad(lossU)(uv).asArray(Float.self)
+        XCTAssertEqual(dU, [0, 0])
+    }
+
+    // MARK: - mipLevelBias
+
+    /// `mipLevelBias` scales `uvDA` by 2^bias before the LOD computation. So
+    /// rendering with `bias = +log₂(k)` should be equivalent to rendering
+    /// with `uvDA · k`.
+    func testMipLevelBiasIsEquivalentToScaledUVDA() {
+        let tex = MLXArray((0..<32).map { Float($0) * 0.05 }, [1, 4, 4, 2])
+        let uv = MLXArray([Float(0.42), 0.31], [1, 1, 1, 2])
+        let uvDA = MLXArray([Float(0.3), 0.1, 0.1, 0.3], [1, 1, 1, 4])
+
+        let bias: Float = 1.0   // 2^1 = 2 → equivalent to uvDA·2
+        let outBiased = DiffRast.texture(tex, uv: uv, uvDA: uvDA,
+                                         filterMode: .linearMipmapLinear,
+                                         mipLevelBias: bias)
+        let outScaled = DiffRast.texture(tex, uv: uv, uvDA: uvDA * 2,
+                                         filterMode: .linearMipmapLinear)
+        let b = outBiased.asArray(Float.self)
+        let s = outScaled.asArray(Float.self)
+        for i in 0..<b.count {
+            XCTAssertEqual(b[i], s[i], accuracy: 1e-5,
+                           "channel \(i): bias=1 \(b[i]) vs uvDA·2 \(s[i])")
+        }
+    }
+
     private func runTrilinearGradcheck(perturb: PerturbTarget) throws {
         let N = 1, Himg = 2, Wimg = 2, Htex = 4, Wtex = 4, C = 2
 
